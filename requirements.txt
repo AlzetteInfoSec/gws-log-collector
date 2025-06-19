@@ -1,5 +1,5 @@
-google-api-python-client
-google-auth
-requests
-python-dateutil
-tqdm
+google-api-python-client>=2.173.0  # Critical for Keep and Vault logs
+google-auth>=2.3.0
+google-auth-oauthlib>=0.4.6
+requests>=2.25.0
+python-dateutil>=2.8.0

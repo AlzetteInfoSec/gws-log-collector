@@ -13,13 +13,19 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
 from dateutil import parser as dateparser, tz
 from googleapiclient.errors import HttpError
-from tqdm import tqdm
 import shutil
 import traceback
 
 # Google Workspace Log Collector
+#
+# Supports two authentication methods:
+# 1. Service Account (default) - Automated, requires service account delegation, some log types may not be available
+# 2. OAuth - Interactive, supports all log types including Keep logs, requires user interaction
 #
 # Based on and inspired by the original gws-get-logs.py script by Megan Roddie-Fonseca:
 # https://github.com/dlcowen/sansfor509/blob/main/GWS/gws-log-collection/gws-get-logs.py
@@ -30,7 +36,7 @@ class Google(object):
     """
 
     # These applications will be collected by default
-    DEFAULT_APPLICATIONS = ['access_transparency', 'admin', 'calendar', 'chat', 'chrome', 'context_aware_access', 'data_studio', 'drive', 'gcp', 'gplus', 'groups', 'groups_enterprise', 'jamboard', 'login', 'meet', 'mobile', 'rules', 'saml', 'token', 'user_accounts']
+    DEFAULT_APPLICATIONS = ['access_transparency', 'admin', 'calendar', 'chat', 'chrome', 'context_aware_access', 'data_studio', 'drive', 'gcp', 'gplus', 'groups', 'groups_enterprise', 'jamboard', 'keep', 'login', 'meet', 'mobile', 'rules', 'saml', 'token', 'user_accounts', 'vault']
     
     # API retry settings
     RETRY_MAX_ATTEMPTS = 5
@@ -39,20 +45,40 @@ class Google(object):
     RETRY_MAX_DELAY = 60
 
     def __init__(self, **kwargs):
-        self.SERVICE_ACCOUNT_FILE = kwargs['creds_path']
-        self.delegated_creds = kwargs['delegated_creds']
+        self.creds_path = kwargs['creds_path']
+        self.auth_method = kwargs.get('auth_method', 'service-account')
+        self.delegated_creds = kwargs.get('delegated_creds')  # Only needed for service account
         self.output_path = kwargs['output_path']
         self.app_list = kwargs['apps']
         self.update = kwargs['update']
-        self.max_results = kwargs.get('max_results', 1000)  # Default page size
+        self.max_results = kwargs.get('max_results', 1000)  # Default API page size
         self.num_threads = kwargs.get('num_threads', 20)    # Default 20 threads
         self.verbosity = kwargs.get('verbosity', 1)         # Default verbosity level
         self.show_progress = kwargs.get('show_progress', True)  # Progress bar
-        self.batch_size = kwargs.get('batch_size', 10000)   # File write batch size
+        self.write_batch_size = kwargs.get('write_batch_size', 100000)  # Write to disk every N events
         self.gws_domain = kwargs['gws_domain']
         self.update_mode = kwargs.get('update_mode', None)
         self.original_update_path = kwargs.get('original_update_path', None)
         self.collection_timestamp = kwargs['consistent_timestamp'] # Use passed consistent timestamp
+        
+        # OAuth specific settings
+        self.oauth_port = kwargs.get('oauth_port', 8089)
+        self.token_file = os.path.abspath(kwargs.get('token_file', 'token.json'))
+        
+        # Initialize locks early (needed for OAuth logging)
+        self.log_lock = threading.Lock()
+        self.stats_lock = threading.Lock()
+        
+        # Initialize credentials during startup (main thread)
+        self._credentials = None
+        if self.auth_method == 'oauth':
+            if self.verbosity >= 1:
+                logging.info("Initializing OAuth authentication...")
+            # Set up OAuth credentials now in the main thread
+            SCOPES = ['https://www.googleapis.com/auth/admin.reports.audit.readonly']
+            self._credentials = self._get_oauth_credentials(SCOPES)
+            if self.verbosity >= 1:
+                logging.info("OAuth authentication completed successfully")
         
         # Collection type - used in folder and file names
         if self.update:
@@ -79,9 +105,6 @@ class Google(object):
         # Stats for CSV output
         self.file_stats_dict = {} # Using a dict, will be converted to list later
         
-        # Lock for thread-safe output
-        self.log_lock = threading.Lock()
-        
         # Stats tracking
         self.stats = {
             'total_saved': 0, 
@@ -90,24 +113,30 @@ class Google(object):
             'retries': 0,
             'errors': 0
         }
-        self.stats_lock = threading.Lock()
-        
-        # Progress tracking
-        self.progress_bars = {}
-        self.progress_lock = threading.Lock()
 
         # Create output path if required
         if not os.path.exists(self.output_path):
             os.makedirs(self.output_path)
             
-        # Service cache for threads
+        # Service cache for threads - more efficient caching
         self._service_cache = threading.local()
+        self._service_instance = None  # Class-level cache for same credentials
             
         if self.verbosity >= 2:
             logging.info(f"Initialized with {self.num_threads} threads, verbosity level {self.verbosity}")
             
         # Start time measurement
         self.start_time = time.time()
+        
+        # Initialize display tracking
+        self._display_lines_count = 0
+        self._counts_display_lines = 0
+        self._last_display_update = 0  # Initialize display throttling
+        
+        # Initialize progress tracking for large collections
+        self.app_activities = {}
+        self.app_status = {}  # Track status: 'downloading', 'done'
+        self.app_downloaded = {}  # Track downloaded counts for progress
 
         # For update mode, load previous stats for initial_collection_time
         self.previous_initial_times = {}
@@ -195,29 +224,44 @@ class Google(object):
     def google_session(self):
         """
         Establish connection to Google Workspace.
-        Using thread-local storage to ensure thread safety.
+        Using optimized caching to ensure thread safety and performance.
+        Supports both Service Account and OAuth authentication.
         """
         # Check if we already have a service in thread-local storage
         if hasattr(self._service_cache, 'service'):
             return self._service_cache.service
+        
+        # Check if we have a class-level cached service (for same credentials)
+        if self._service_instance is not None:
+            self._service_cache.service = self._service_instance
+            return self._service_instance
             
         # Create new service for this thread
         try:
-            SCOPES = ['https://www.googleapis.com/auth/admin.reports.audit.readonly', 
-                      'https://www.googleapis.com/auth/apps.alerts']
-                      
-            creds = service_account.Credentials.from_service_account_file(
-                self.SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-            delegated_credentials = creds.with_subject(self.delegated_creds)
+            if self.auth_method == 'oauth':
+                # Use pre-initialized OAuth credentials
+                if not self._credentials:
+                    raise ValueError("OAuth credentials not initialized")
+                credentials = self._credentials
+            else:
+                # Service Account authentication (original method)
+                if not self.delegated_creds:
+                    raise ValueError("delegated_creds is required for service account authentication")
+                    
+                SCOPES = ['https://www.googleapis.com/auth/admin.reports.audit.readonly']
+                creds = service_account.Credentials.from_service_account_file(
+                    self.creds_path, scopes=SCOPES)
+                credentials = creds.with_subject(self.delegated_creds)
 
-            service = build('admin', 'reports_v1', credentials=delegated_credentials)
+            service = build('admin', 'reports_v1', credentials=credentials)
             
-            # Store in thread-local storage
+            # Store in both thread-local and class-level cache
             self._service_cache.service = service
+            self._service_instance = service
             
             if self.verbosity >= 3:
                 with self.log_lock:
-                    logging.debug(f"Thread {threading.current_thread().name} created new API session")
+                    logging.debug(f"Thread {threading.current_thread().name} created new API session using {self.auth_method}")
                     
             return service
             
@@ -225,6 +269,106 @@ class Google(object):
             with self.log_lock:
                 logging.error(f"Failed to create Google API session: {e}")
             raise
+
+    def _get_oauth_credentials(self, scopes):
+        """
+        Handle OAuth authentication flow (based on ALFA implementation)
+        """
+        creds = None
+        
+        if self.verbosity >= 2:
+            with self.log_lock:
+                logging.debug(f"Looking for OAuth token at: {self.token_file}")
+                logging.debug(f"Token file exists: {os.path.exists(self.token_file)}")
+        
+        # Check if we have a saved token (ALFA approach)
+        if os.path.exists(self.token_file):
+            try:
+                creds = Credentials.from_authorized_user_file(self.token_file)
+                if self.verbosity >= 2:
+                    with self.log_lock:
+                        logging.info(f"Loaded existing OAuth token from {self.token_file}")
+            except Exception as e:
+                # Check if it's the specific refresh_token missing error
+                if "missing fields refresh_token" in str(e):
+                    if self.verbosity >= 1:
+                        with self.log_lock:
+                            logging.warning(f"Token missing refresh_token field. This is normal if you've previously authorized this app. Authentication will still work.")
+                else:
+                    if self.verbosity >= 1:
+                        with self.log_lock:
+                            logging.warning(f"Could not load existing token: {e}")
+                
+                # Try loading token manually like ALFA might
+                try:
+                    with open(self.token_file, 'r') as f:
+                        token_data = json.load(f)
+                    # Create credentials from token data
+                    creds = Credentials(
+                        token=token_data.get('token'),
+                        refresh_token=token_data.get('refresh_token'),
+                        token_uri=token_data.get('token_uri'),
+                        client_id=token_data.get('client_id'),
+                        client_secret=token_data.get('client_secret'),
+                        scopes=token_data.get('scopes')
+                    )
+                    if self.verbosity >= 2:
+                        with self.log_lock:
+                            logging.info(f"Manually loaded OAuth token from {self.token_file}")
+                except Exception as e2:
+                    if self.verbosity >= 1:
+                        with self.log_lock:
+                            logging.warning(f"Could not manually load token: {e2}")
+                    creds = None
+                
+        # ALFA's approach: check validity and refresh if needed
+        if not creds or not creds.valid:
+            if not os.path.exists(self.creds_path):
+                error_msg = f"""
+[!] Missing OAuth credentials file: {self.creds_path}
+
+[*] Please run OAuth initialization first:
+   python gws-log-collector.py --init --creds-path {self.creds_path}
+
+[+] This will:
+   1. Set up OAuth authentication 
+   2. Create the token file
+   3. Enable access to all log types including Keep
+"""
+                raise ValueError(error_msg)
+                
+            # Try to refresh if we have refresh token (ALFA approach)
+            if creds and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                    if self.verbosity >= 2:
+                        with self.log_lock:
+                            logging.info("Refreshed OAuth token")
+                    # Save refreshed token
+                    with open(self.token_file, 'w') as token:
+                        token.write(creds.to_json())
+                except Exception as e:
+                    if self.verbosity >= 1:
+                        with self.log_lock:
+                            logging.warning(f"Token refresh failed: {e}")
+                    creds = None
+            
+            # If still no valid credentials, require re-init (don't auto-authenticate here)
+            if not creds or not creds.valid:
+                error_msg = f"""
+[!] OAuth token not found or invalid: {self.token_file}
+
+[*] Please run OAuth initialization first:
+   python gws-log-collector.py --init --creds-path {self.creds_path}
+
+[+] This will:
+   1. Set up OAuth authentication 
+   2. Create the token file
+   3. Enable access to all log types including Keep
+"""
+                raise ValueError(error_msg)
+        
+        return creds
 
     def _api_call_with_retry(self, service_method, **kwargs):
         """
@@ -478,14 +622,26 @@ class Google(object):
                         logging.info(f"Will only fetch {app} logs after {app_from_date}")
                 tasks.append((app, output_file, app_from_date))
         
-        # Initialize progress tracking if enabled
-        if self.show_progress and self.verbosity >= 1:
-            self.master_progress = tqdm(
-                total=len(tasks), 
-                desc="Overall Progress", 
-                unit="app", 
-                position=0
-            )
+        # Initialize activity tracking for ALFA-style output
+        self.app_activities = {app: 0 for app in self.app_list}
+        self.app_downloaded = {app: 0 for app in self.app_list}  # Initialize all apps
+        self.apps_completed = 0
+        self.apps_total = len(tasks)
+        self.apps_in_progress = set()  # Track which apps are currently being processed
+        self.apps_done = set()  # Track which apps are completed
+        
+        # Mark skipped apps as done immediately
+        for skipped_app in skipped_apps:
+            self.apps_done.add(skipped_app)
+        
+
+        
+        # Show initial ALFA-style output
+        if self.verbosity >= 1:
+            print("Collecting logs...")
+            # Reset display lines count for collection phase
+            self._display_lines_count = 0
+            self._display_activity_status()
         
         # Create a thread pool
         with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
@@ -499,6 +655,14 @@ class Google(object):
                 ): (app_task, output_file_task) for app_task, output_file_task, only_after_datetime_task in tasks
             }
             
+            # Mark all submitted apps as in progress
+            for app_task, output_file_task, only_after_datetime_task in tasks:
+                self.apps_in_progress.add(app_task)
+            
+            # Update display to show in-progress status
+            if self.verbosity >= 1:
+                self._display_activity_status()
+            
             # Process results as they complete
             for future in as_completed(futures):
                 app_processed, output_file_processed = futures[future] # Get app_name and output_file for this future
@@ -507,6 +671,9 @@ class Google(object):
                 try:
                     # _get_activity_logs should return (new_records_written_this_run, records_fetched_from_api_this_run)
                     newly_written_for_app, fetched_from_api_for_app = future.result()
+                    
+                    # Update activity count for this app
+                    self.app_activities[app_processed] = fetched_from_api_for_app
                     
                     actual_record_count_in_file = 0
                     try:
@@ -555,20 +722,18 @@ class Google(object):
                     if self.verbosity >= 0: logging.error(f"CRITICAL: App {app_processed} from future not found in pre-populated stats dictionary! Adding it now.")
                     self.file_stats_dict[app_processed] = current_app_stats_dict_entry # Add if somehow missing
                     
-                # Update progress if enabled
-                if self.show_progress and self.verbosity >= 1 and hasattr(self, 'master_progress'):
-                    self.master_progress.update(1)
-        
-        # Close progress bar
-        if self.show_progress and self.verbosity >= 1 and hasattr(self, 'master_progress'):
-            self.master_progress.close()
+                # Update progress tracking
+                self.apps_in_progress.discard(app_processed)  # Remove from in-progress
+                self.apps_done.add(app_processed)  # Add to completed
+                self.apps_completed += 1
+                
+                # Update progress display
+                if self.verbosity >= 1:
+                    self._display_activity_status()
             
-            # Clean up any app-specific progress bars
-            with self.progress_lock:
-                for app_prog_bar_name in list(self.progress_bars.keys()): # Use app_prog_bar_name
-                    if self.progress_bars[app_prog_bar_name]:
-                        self.progress_bars[app_prog_bar_name].close()
-                        self.progress_bars[app_prog_bar_name] = None # Clear it
+        # Final display
+        if self.verbosity >= 1:
+            self._display_activity_status(final=True)
         
         # Convert the dictionary of stats to a list for CSV writing and other uses
         self.file_stats = list(self.file_stats_dict.values())
@@ -590,25 +755,102 @@ class Google(object):
         
         return self.stats
 
+    def _display_activity_status(self, final=False):
+        """
+        Display ALFA-style activity status with progress information
+        """
+        # Safety check to prevent infinite display loops
+        if hasattr(self, '_display_in_progress') and self._display_in_progress:
+            return
+        self._display_in_progress = True
+        
+        try:
+            # Move cursor up to overwrite previous output (except for first time)
+            if hasattr(self, '_display_lines_count') and self._display_lines_count > 0:
+                # Safety limit on cursor movement
+                lines_to_clear = min(self._display_lines_count, 50)  # Max 50 lines
+                for _ in range(lines_to_clear):
+                    print("\033[F\033[K", end="")  # Move up and clear line
+        
+            lines_printed = 0
+        
+            # Show applications in simplified tab-delimited format: downloaded activities - STATUS
+            for app in sorted(self.app_list):
+                downloaded_count = self.app_downloaded.get(app, 0)
+            
+                # Determine status indicator
+                if app in self.apps_done:
+                    status = "DONE"
+                elif app in self.apps_in_progress:
+                    status = "DOWNLOADING..."
+                elif hasattr(self, 'app_status') and self.app_status.get(app) == 'unsupported':
+                    status = "UNSUPPORTED"
+                else:
+                    status = ""
+            
+                # Show downloaded count only (no totals or percentages)
+                count_display = f"{downloaded_count}"
+                print(f"{app:>25}:\t{count_display:>10} activities - {status}")
+                lines_printed += 1
+        
+            # Show progress bar at the bottom (only if not final or if we want to show completion)
+            if self.apps_total > 0:
+                progress_pct = (self.apps_completed / self.apps_total) * 100
+                elapsed = time.time() - self.start_time
+                rate = self.apps_completed / elapsed if elapsed > 0 else 0
+                remaining = (self.apps_total - self.apps_completed) / rate if rate > 0 and not final else 0
+            
+                progress_line = f"Overall Progress: {progress_pct:3.0f}% | {self.apps_completed}/{self.apps_total} [{elapsed:05.2f}<{remaining:05.2f}, {rate:5.2f}app/s]"
+                print(progress_line)
+                lines_printed += 1
+        
+            if final:
+                print()  # Add extra line at the end for spacing before summary
+                lines_printed += 1
+        
+            # Store the number of lines we printed for next time
+            self._display_lines_count = lines_printed
+            
+        finally:
+            # Always reset the display flag
+            self._display_in_progress = False
+
+    def _handle_unsupported_app_error(self, application_name, total_count=0):
+        """Handle unsupported application errors gracefully to prevent display corruption"""
+        if hasattr(self, 'app_status'):
+            self.app_status[application_name] = 'unsupported'
+        return total_count
+
+    def _write_entries_to_file(self, entries, output_file, mode='a'):
+        """Helper method to write entries to file with proper formatting"""
+        try:
+            with open(output_file, mode) as f:
+                for entry in entries:
+                    f.write(entry.rstrip() + '\n')
+            return True
+        except Exception as e:
+            with self.log_lock:
+                logging.error(f"Error writing to {output_file}: {e}")
+            return False
+
     def _get_activity_logs(self, application_name, output_file, only_after_datetime=None):
-        """ Collect activity logs from the specified application with pagination support """
+        """ Collect activity logs from the specified application with pagination support and incremental writing """
         if self.verbosity >= 2:
             with self.log_lock:
                 logging.info(f"Starting collection for {application_name}...")
+        
+        # Initialize progress tracking (totals should already be set from upfront counting)
+        if application_name not in self.app_downloaded:
+            self.app_downloaded[application_name] = 0
+        self.app_status[application_name] = 'downloading'
+            
         service = self.google_session()
         total_activities = 0
         output_count = 0
         page_token = None
         page_count = 0
-        entries_buffer = []  # Buffer for batch writing
-        if self.show_progress and self.verbosity >= 2:
-            with self.progress_lock:
-                position = len(self.progress_bars) + 1
-                self.progress_bars[application_name] = tqdm(
-                    desc=f"{application_name}", 
-                    unit="record",
-                    position=position
-                )
+        write_count = 0  # Track records written for incremental writing
+        
         if self.update and os.path.exists(output_file):
             # Deduplication mode (for all logs)
             existing_entries = set()
@@ -621,7 +863,8 @@ class Google(object):
                             continue
                         try:
                             entry = json.loads(line)
-                            entry_id = f"{entry.get('id', {}).get('time', '')}-{entry.get('id', {}).get('uniqueQualifier', '')}"
+                            entry_id_dict = entry.get('id', {})
+                            entry_id = f"{entry_id_dict.get('time', '')}-{entry_id_dict.get('uniqueQualifier', '')}"
                             existing_entries.add(entry_id)
                             existing_lines.append(line)
                         except Exception as e:
@@ -652,18 +895,23 @@ class Google(object):
                             pageToken=page_token
                         )
                     except Exception as e:
-                        with self.log_lock:
-                            logging.error(f"Failed to fetch logs for {application_name}: {e}")
+                        error_str = str(e)
+                        if "does not match the pattern" in error_str:
+                            with self.log_lock:
+                                if self.auth_method == 'service-account':
+                                    logging.warning(f"Application '{application_name}' not supported with Service Account authentication. Try --auth-method oauth for full access.")
+                                else:
+                                    logging.warning(f"Application '{application_name}' not supported by API (not available for this Google Workspace account/edition)")
+                        else:
+                            with self.log_lock:
+                                logging.error(f"Failed to fetch logs for {application_name}: {e}")
                         with self.stats_lock:
                             self.stats['errors'] += 1
                         return 0, len(existing_entries)
                     activities = results.get('items', [])
                     page_activities = len(activities)
                     total_activities += page_activities
-                    if self.show_progress and self.verbosity >= 2:
-                        with self.progress_lock:
-                            if application_name in self.progress_bars and self.progress_bars[application_name]:
-                                self.progress_bars[application_name].update(page_activities)
+                    
                     page_token = results.get('nextPageToken')
                     if self.verbosity >= 3:
                         with self.log_lock:
@@ -682,7 +930,8 @@ class Google(object):
                                             logging.warning(f"Invalid date in entry: {e}")
                                     continue
                             try:
-                                entry_id = f"{entry.get('id', {}).get('time', '')}-{entry.get('id', {}).get('uniqueQualifier', '')}"
+                                entry_id_dict = entry.get('id', {})
+                                entry_id = f"{entry_id_dict.get('time', '')}-{entry_id_dict.get('uniqueQualifier', '')}"
                             except Exception as e:
                                 if self.verbosity >= 3:
                                     with self.log_lock:
@@ -694,7 +943,7 @@ class Google(object):
                                         logging.debug(f"Skipping duplicate entry: {entry_id}")
                                 continue
                             existing_entries.add(entry_id)
-                            json_formatted_str = json.dumps(entry)
+                            json_formatted_str = json.dumps(entry, separators=(',', ':'))
                             new_entries.append(json_formatted_str)
                             output_count += 1
                     if not page_token:
@@ -704,20 +953,23 @@ class Google(object):
                     # Only write new entries
                     with open(output_file, 'w') as f:
                         for line in new_entries:
-                            f.write(line.rstrip() + '\n')
+                            f.write(line + '\n')
                     if self.verbosity >= 2:
                         with self.log_lock:
                             logging.info(f"Wrote {len(new_entries)} new entries to {output_file} (diff mode)")
                     total_lines = len(new_entries)
                 else:
                     # Default: append mode (write all unique entries)
-                    all_entries = existing_lines + new_entries
                     with open(output_file, 'w') as f:
-                        for line in all_entries:
+                        # Write existing lines (may need rstrip)
+                        for line in existing_lines:
                             f.write(line.rstrip() + '\n')
+                        # Write new entries (already clean JSON strings)
+                        for line in new_entries:
+                            f.write(line + '\n')
                     if self.verbosity >= 2:
                         with self.log_lock:
-                            logging.info(f"Wrote {len(new_entries)} new entries to {output_file} with deduplication. Total unique: {len(all_entries)}")
+                            logging.info(f"Wrote {len(new_entries)} new entries to {output_file} with deduplication. Total unique: {len(existing_lines) + len(new_entries)}")
                     # After writing, recount the lines for record_count
                     try:
                         with open(output_file, 'r') as f:
@@ -730,16 +982,13 @@ class Google(object):
                 with self.stats_lock:
                     self.stats['errors'] += 1
                 total_lines = len(existing_entries) + len(new_entries)
-            if self.show_progress and self.verbosity >= 2:
-                with self.progress_lock:
-                    if application_name in self.progress_bars and self.progress_bars[application_name]:
-                        self.progress_bars[application_name].close()
-                        self.progress_bars[application_name] = None
+            
             # Return new records added, and total records in file
             return output_count, total_activities
         else:
-            # Normal logic for initial collection
-            output_file_handle = open(output_file, 'w')
+            # Normal logic for initial collection with incremental writing
+            written_entries = []  # Track all entries for final write
+                
             try:
                 while True:
                     page_count += 1
@@ -755,22 +1004,32 @@ class Google(object):
                             pageToken=page_token
                         )
                     except Exception as e:
-                        with self.log_lock:
-                            logging.error(f"Failed to fetch logs for {application_name}: {e}")
+                        error_str = str(e)
+                        if "does not match the pattern" in error_str:
+                            with self.log_lock:
+                                if self.auth_method == 'service-account':
+                                    logging.warning(f"Application '{application_name}' not supported with Service Account authentication. Try --auth-method oauth for full access.")
+                                else:
+                                    logging.warning(f"Application '{application_name}' not supported by API (not available for this Google Workspace account/edition)")
+                        else:
+                            with self.log_lock:
+                                logging.error(f"Failed to fetch logs for {application_name}: {e}")
                         with self.stats_lock:
                             self.stats['errors'] += 1
+                        # Update status and return
+                        self.app_status[application_name] = 'done'
+                        self.app_activities[application_name] = output_count
                         return 0, total_activities
+                        
                     activities = results.get('items', [])
                     page_activities = len(activities)
                     total_activities += page_activities
-                    if self.show_progress and self.verbosity >= 2:
-                        with self.progress_lock:
-                            if application_name in self.progress_bars and self.progress_bars[application_name]:
-                                self.progress_bars[application_name].update(page_activities)
+                    
                     page_token = results.get('nextPageToken')
                     if self.verbosity >= 3:
                         with self.log_lock:
                             logging.debug(f"{application_name}: Page {page_count} has {page_activities} activities, next token: {page_token}")
+                            
                     if activities:
                         for entry in activities[::-1]:
                             if only_after_datetime:
@@ -783,24 +1042,95 @@ class Google(object):
                                         with self.log_lock:
                                             logging.warning(f"Invalid date in entry: {e}")
                                     continue
-                            json_formatted_str = json.dumps(entry)
-                            entries_buffer.append(json_formatted_str)
+                            json_formatted_str = json.dumps(entry, separators=(',', ':'))
                             output_count += 1
-                            # Write in batches for better performance
-                            if len(entries_buffer) >= self.batch_size:
-                                output_file_handle.write('\n'.join(entries_buffer) + '\n')
-                                entries_buffer = []
+                            write_count += 1
+                            
+                            # Handle incremental writing
+                            if self.write_batch_size > 0:
+                                # Add to buffer for incremental writing
+                                written_entries.append(json_formatted_str)
+                                
+                                # Write in batches when we reach write_batch_size
+                                if write_count >= self.write_batch_size:
+                                    # Write entries and clear buffer to free memory
+                                    write_mode = 'w' if output_count == len(written_entries) else 'a'
+                                    if self._write_entries_to_file(written_entries, output_file, write_mode):
+                                        if self.verbosity >= 2:
+                                            with self.log_lock:
+                                                logging.info(f"Incremental write: {len(written_entries)} records written to {application_name}")
+                                        
+                                        # Update progress tracking only when batch is written to disk
+                                        self.app_downloaded[application_name] = output_count
+                                        self.app_activities[application_name] = output_count
+                                        
+                                        # Update display only when batch is written to disk
+                                        if self.verbosity >= 1:
+                                            current_time = time.time()
+                                            # Only update display if enough time has passed (minimum 0.5 seconds between updates)
+                                            if current_time - self._last_display_update >= 0.5:
+                                                self._display_activity_status()
+                                                self._last_display_update = current_time
+                                        
+                                        # Clear buffer to free memory
+                                        written_entries.clear()
+                                        write_count = 0
+                                    else:
+                                        self.app_status[application_name] = 'done'
+                                        return output_count, total_activities
+                            else:
+                                # Traditional mode: keep all entries in memory and update progress periodically
+                                written_entries.append(json_formatted_str)
+                                
+                                # Update progress tracking and display every 1000 records for non-batch mode
+                                if output_count % 1000 == 0:
+                                    self.app_downloaded[application_name] = output_count
+                                    self.app_activities[application_name] = output_count
+                                    
+                                    if self.verbosity >= 1:
+                                        current_time = time.time()
+                                        # Only update display if enough time has passed (minimum 0.5 seconds between updates)
+                                        if current_time - self._last_display_update >= 0.5:
+                                            self._display_activity_status()
+                                            self._last_display_update = current_time
+                                
                     if not page_token:
-                        if entries_buffer:
-                            output_file_handle.write('\n'.join(entries_buffer) + '\n')
                         break
-            finally:
-                output_file_handle.close()
-            if self.show_progress and self.verbosity >= 2:
-                with self.progress_lock:
-                    if application_name in self.progress_bars and self.progress_bars[application_name]:
-                        self.progress_bars[application_name].close()
-                        self.progress_bars[application_name] = None
+                        
+            except Exception as e:
+                with self.log_lock:
+                    logging.error(f"Error during collection for {application_name}: {e}")
+                with self.stats_lock:
+                    self.stats['errors'] += 1
+                    
+            # Final write of remaining entries (create file even if empty)
+            if self.write_batch_size > 0:
+                # Incremental mode: write any remaining entries and ensure file exists
+                if written_entries:
+                    # Append remaining entries
+                    if not self._write_entries_to_file(written_entries, output_file, 'a'):
+                        with self.stats_lock:
+                            self.stats['errors'] += 1
+                elif output_count == 0:
+                    # No entries at all, create empty file
+                    if not self._write_entries_to_file([], output_file, 'w'):
+                        with self.stats_lock:
+                            self.stats['errors'] += 1
+            else:
+                # Traditional mode: write all entries at once
+                if not self._write_entries_to_file(written_entries, output_file, 'w'):
+                    with self.stats_lock:
+                        self.stats['errors'] += 1
+                    
+            # Update final status and ensure final progress is recorded
+            self.app_status[application_name] = 'done'
+            self.app_activities[application_name] = output_count
+            self.app_downloaded[application_name] = output_count
+            
+            # Final display update to show completion
+            if self.verbosity >= 1:
+                self._display_activity_status()
+            
             return output_count, total_activities
 
     def print_execution_summary(self):
@@ -832,6 +1162,7 @@ class Google(object):
         print(f"Records found: {self.stats['total_found']}")
         print(f"Records saved: {self.stats['total_saved']}")
         print(f"Collection type: {self.collection_type.upper()}")
+        print(f"Collection folder: {os.path.abspath(self.output_path)}")
         
         # Stats file information - path adjusted to parent directory
         output_collection_parent_dir = os.path.dirname(os.path.abspath(self.output_path.rstrip('/\\')))
@@ -860,6 +1191,103 @@ class Google(object):
         print("="*80)
 
 
+def handle_oauth_init(args):
+    """
+    Handle OAuth initialization similar to ALFA's approach
+    """
+    # Default credentials path for OAuth  
+    creds_path = os.path.abspath(args.creds_path or 'oauth_credentials.json')
+    token_path = os.path.abspath(args.token_file or 'token.json')
+    
+    print("="*80)
+    print("OAUTH INITIALIZATION")
+    print("="*80)
+    
+    # Check if credentials file exists
+    if not os.path.exists(creds_path):
+        print(f"\n[!] Missing OAuth credentials file: {creds_path}")
+        print("\n[*] How to create OAuth credentials:")
+        print("1. Go to https://console.cloud.google.com/apis/credentials")
+        print("2. Create a new project or select existing one")
+        print("3. Click 'Create Credentials' → 'OAuth client ID'")
+        print("4. Choose 'Desktop application' as application type")
+        print("5. Download the JSON file and save it as:", creds_path)
+        print("\n[*] Required API:")
+        print("   Make sure 'Admin SDK API' is enabled in your project")
+        print("   https://console.cloud.google.com/apis/library/admin.googleapis.com")
+        return False
+    
+    print(f"[+] Found OAuth credentials file: {creds_path}")
+    
+    # Check if token already exists
+    if os.path.exists(token_path):
+        print(f"[!] Existing token found: {token_path}")
+        
+        # Check if existing token has refresh_token
+        try:
+            with open(token_path, 'r') as f:
+                token_data = json.load(f)
+            if 'refresh_token' not in token_data:
+                print("[!] Existing token is missing refresh_token - will re-authenticate")
+                choice = 'y'
+            else:
+                choice = input("Do you want to re-authenticate? [y/N]: ").strip().lower()
+        except Exception:
+            print("[!] Existing token is corrupted - will re-authenticate") 
+            choice = 'y'
+            
+        if choice not in ['y', 'yes']:
+            print("[+] Using existing token")
+            return True
+        else:
+            os.remove(token_path)
+            print("[*] Deleted existing token")
+    
+    # Perform OAuth flow
+    print(f"\n[*] Starting OAuth authentication...")
+    print(f"[*] Browser will open for Google authentication")
+    print(f"[*] Using callback port: {args.oauth_port}")
+    print(f"\n[+] IMPORTANT: To ensure refresh token is included:")
+    print(f"   1. If you've previously authorized this app, you may need to revoke access first")
+    print(f"   2. Visit: https://myaccount.google.com/permissions") 
+    print(f"   3. Find and remove this application if it exists")
+    print(f"   4. The OAuth flow will force consent to ensure refresh token is generated")
+    print(f"\n[*] Starting OAuth flow...")
+    
+    try:
+        # Initialize OAuth flow
+        SCOPES = ['https://www.googleapis.com/auth/admin.reports.audit.readonly']
+        
+        flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
+        
+        # Use ALFA's approach - simple OAuth flow with access_type=offline to ensure refresh_token
+        creds = flow.run_local_server(
+            port=args.oauth_port,
+            access_type='offline',
+            prompt='consent'
+        )
+        
+        # Check if we got valid credentials (ALFA approach)
+        if not creds or not creds.valid:
+            print(f"\n[!] WARNING: Invalid credentials received!")
+            return False
+        
+        # Save the credentials
+        with open(token_path, 'w') as token:
+            token.write(creds.to_json())
+            
+        print(f"[+] OAuth authentication successful!")
+        print(f"[*] Token saved to: {token_path}")
+        print(f"\n[+] You can now use OAuth authentication:")
+        print(f"   python gws-log-collector.py --auth-method oauth --creds=\"{creds_path}\" --gws-domain YOUR_DOMAIN")
+        
+        return True
+        
+    except Exception as e:
+        print(f"[!] OAuth authentication failed: {e}")
+        return False
+
+
 if __name__ == '__main__':
 
     # Record start time
@@ -867,16 +1295,28 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='This script will fetch Google Workspace logs.')
 
-    # Mandatory credential arguments
-    parser.add_argument('--creds-path', required=True, help=".json credential file for the service account.")
-    parser.add_argument('--delegated-creds', required=True, help="Principal name of the service account")
-    parser.add_argument('--gws-domain', required=True, help="Google Workspace domain (e.g. example.com)")
+    # Main commands
+    parser.add_argument('--init', required=False, action='store_true',
+                        help="Initialize OAuth credentials (required once before using OAuth authentication)")
+    
+    # Authentication arguments
+    parser.add_argument('--creds-path', required=False, help="Path to credentials file (.json). For service-account: service account JSON file. For oauth: OAuth client secrets JSON file.")
+    parser.add_argument('--auth-method', required=False, choices=['service-account', 'oauth'], default='service-account',
+                        help="Authentication method. 'service-account' for automated access (default), 'oauth' for interactive authentication (supports Keep logs and others)")
+    parser.add_argument('--delegated-creds', required=False, help="Principal name for service account delegation (required for service-account method)")
+    parser.add_argument('--gws-domain', required=False, help="Google Workspace domain (e.g. example.com)")
+    
+    # OAuth specific arguments
+    parser.add_argument('--oauth-port', required=False, type=int, default=8089,
+                        help="Port for OAuth callback server (default: 8089, only used with oauth method)")
+    parser.add_argument('--token-file', required=False, default='token.json',
+                        help="Path to store OAuth token file (default: token.json, only used with oauth method)")
     # Output path - now has default with timestamp
     parser.add_argument('--output-path', '-o', required=False, 
                         help="Folder to save downloaded logs. Default is 'collection_<gws-domain>_<collection_type>_<collection_timestamp>'")
-    parser.add_argument('--apps', '-a', required=False, default=','.join(Google.DEFAULT_APPLICATIONS), 
+    parser.add_argument('--apps', '-a', required=False, default='all', 
                         help="Comma separated list of applications whose logs will be downloaded. "
-                         "Or 'all' to attempt to download all available logs")
+                         "Or 'all' to attempt to download all available logs (default)")
     parser.add_argument('--from-date', required=False, default=None,
                         type=lambda s: dateparser.parse(s).replace(tzinfo=tz.gettz('UTC')),
                         help="Only capture log entries from the specified date [yyyy-mm-dd format]. This flag is ignored if --update is set and existing files are already present.")
@@ -887,13 +1327,13 @@ if __name__ == '__main__':
                         help="Update mode: 'append' (deduplicate and write all unique records) or 'diff' (write only new records found in this update). REQUIRED if --update is used.")
     # Add max_results parameter
     parser.add_argument('--max-results', required=False, type=int, default=1000,
-                        help="Maximum number of results per page (1-1000). Default is 1000.")
+                        help="Maximum number of results per API page (1-1000). Default is 1000.")
     # Add thread count parameter
     parser.add_argument('--threads', '-t', dest="num_threads", required=False, type=int, default=20,
                         help="Number of parallel threads to use for fetching logs. Default is 20.")
-    # Add batch size parameter
-    parser.add_argument('--batch-size', required=False, type=int, default=10000,
-                        help="Number of records to buffer before writing to disk. Higher values may improve performance. Default is 10000.")
+    # Add write batch size parameter
+    parser.add_argument('--write-batch-size', required=False, type=int, default=100000,
+                        help="Write log entries to disk every N events to reduce memory usage for large collections. Set to 0 to write only at the end. Default is 100000.")
     # Progress bar control
     parser.add_argument('--no-progress', required=False, action="store_true",
                         help="Disable progress bars")
@@ -904,6 +1344,21 @@ if __name__ == '__main__':
                         help="Increase verbosity level (can be used multiple times, e.g. -vv)")
 
     args = parser.parse_args()
+
+    # Handle init command
+    if args.init:
+        handle_oauth_init(args)
+        sys.exit(0)
+
+    # Validation for normal operation
+    if not args.creds_path:
+        parser.error("argument --creds-path is required")
+    if not args.gws_domain:
+        parser.error("argument --gws-domain is required")
+    
+    # Validation based on authentication method
+    if args.auth_method == 'service-account' and not args.delegated_creds:
+        parser.error("argument --delegated-creds is required when using service-account authentication")
 
     # If --update is used, --update-mode becomes mandatory.
     if args.update and not args.update_mode:
@@ -994,10 +1449,21 @@ if __name__ == '__main__':
     elif args.num_threads > 50:
         logging.warning("High thread count (>50) may cause API rate limiting or resource issues")
 
-    # Validate batch size
-    if args.batch_size < 1:
-        logging.warning("batch-size must be at least 1, setting to 1000")
-        args.batch_size = 1000
+    # Validate write frequency
+    if args.write_batch_size < 0:
+        logging.warning("write-batch-size must be 0 or positive, setting to 100000")
+        args.write_batch_size = 100000
+
+    # Log authentication method
+    if verbosity >= 1:
+        if args.auth_method == 'oauth':
+            logging.info(f"Using OAuth authentication - supports all log types including Keep")
+            if verbosity >= 2:
+                logging.info(f"OAuth port: {args.oauth_port}, token file: {args.token_file}")
+        else:
+            logging.info(f"Using Service Account authentication - automated access to all log types")
+            if verbosity >= 2:
+                logging.info(f"Delegated credentials: {args.delegated_creds}")
 
     # DEBUG: Show combined arguments to be used if verbose
     if verbosity >= 3:
@@ -1013,6 +1479,9 @@ if __name__ == '__main__':
         google_args['update_mode'] = args.update_mode
         google_args['original_update_path'] = args.update
         google_args['consistent_timestamp'] = consistent_timestamp_str # Pass consistent timestamp
+        google_args['auth_method'] = args.auth_method
+        google_args['oauth_port'] = args.oauth_port
+        google_args['token_file'] = args.token_file
         
         # Connect to Google API and get logs
         google = Google(**google_args)

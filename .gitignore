@@ -14,4 +14,10 @@ git_data/**
 
 #secrets
 token.pickle
-credentials.json
+credentials*.json
+token.json
+
+# Log collections and stats
+collection_*/
+_stats_*.csv
+_stats_*.json
