@@ -1158,6 +1158,7 @@ class Google(object):
         print(f"EXECUTION SUMMARY")
         print("="*80)
         print(f"Total execution time: {time_str}")
+        print(f"Google Workspace Domain: {self.gws_domain}")
         print(f"Applications processed: {len(self.app_list)}")
         print(f"Records found: {self.stats['total_found']}")
         print(f"Records saved: {self.stats['total_saved']}")
@@ -1178,15 +1179,15 @@ class Google(object):
         if os.path.exists(stats_json_path):
             print(f"Stats file (JSON): {stats_json_path}")
             
-        if self.verbosity >= 2:
-            print(f"API calls: {self.stats['api_calls']}")
-            print(f"API retries: {self.stats['retries']}")
-            print(f"Errors: {self.stats['errors']}")
-            
         if self.stats['total_found'] > 0:
             # Calculate throughput
             records_per_second = self.stats['total_found'] / total_execution_time
             print(f"Throughput: {records_per_second:.2f} records/second")
+            
+        # Always show API statistics
+        print(f"API Calls Made: {self.stats['api_calls']}")
+        print(f"Retries: {self.stats['retries']}")
+        print(f"Errors: {self.stats['errors']}")
             
         print("="*80)
 

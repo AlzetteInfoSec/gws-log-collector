@@ -16,6 +16,7 @@ git_data/**
 token.pickle
 credentials*.json
 token.json
+*.pem
 
 # Log collections and stats
 collection_*/
