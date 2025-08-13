@@ -5,17 +5,18 @@
 This script fetches Google Workspace audit logs for one or more applications, supporting both Service Account (automated) and OAuth (interactive) authentication methods. It supports initial and incremental (update) collections, deduplication, and produces stats files (CSV and JSON) for every run.
 
 ## Features
-- Dual Authentication Support: Service Account (automated) and OAuth (interactive) authentication
-- Complete Log Coverage: Supports all 22 Google Workspace applications including Keep and Vault logs
-- Incremental Writing: Configurable write frequency to reduce memory usage for large collections
-- Real-time Progress Display: Shows downloaded counts and status for each application during collection
-- Collects logs for multiple Google Workspace applications in parallel
-- Supports initial and update (incremental) collections
-- Deduplicates log entries using timestamp and uniqueQualifier
-- Outputs logs as JSON lines, one file per application
-- Produces detailed stats files in both CSV and JSON format for every run, stored in the parent directory of the collection folder
-- Multi-threaded for speed, with progress bars and verbosity control
-- Comprehensive error handling and retry logic
+- **Dual Authentication Support**: Service Account (automated) and OAuth (interactive) authentication
+- **Complete Log Coverage**: Supports all 23+ Google Workspace applications including Keep, Vault, and Gemini logs
+- **Structured Real-time Output**: Clean, timestamped progress display with ISO8601 UTC timestamps and consistent formatting
+- **Advanced Verbose Mode**: Multi-level verbosity with structured output (`-v`, `-vv`, `-vvv`) for detailed debugging
+- **Complete CLI Audit Trail**: Every terminal output saved to timestamped text file for compliance and debugging
+- **Real-time Error Display**: Errors are shown immediately during collection with proper formatting
+- **Incremental Writing**: Configurable write frequency to reduce memory usage for large collections
+- **Multi-threaded Collection**: Parallel processing with detailed progress tracking for each application
+- **Update Collections**: Supports incremental updates with append or diff modes
+- **Deduplication**: Automatic deduplication using timestamp and uniqueQualifier
+- **Comprehensive Stats**: Detailed CSV and JSON stats files for every collection with file integrity hashes
+- **Robust Error Handling**: Automatic retry logic with exponential backoff
 
 ## Authentication Methods
 
@@ -131,6 +132,7 @@ python gws-log-collector.py --auth-method oauth --creds-path <oauth_credentials.
 - `--output-path` / `-o` : Main output directory for collection subfolders (default: current directory). The script will create a subfolder like `collection_<timestamp>_<collection_type>_<gws_domain>` inside this path.
 - `--apps` / `-a` : Comma-separated list of applications or 'all' (default: 'all' - fetches from Google's discovery API)
 - `--from-date` : Only fetch logs after this date (ignored in update mode if files exist)
+- `--to-date` : Only fetch logs before this date (can be combined with --from-date for date range filtering)
 - `--update` / `-u` : Path to an existing collection folder to update with new logs (requires --update-mode).
 - `--update-mode` : **REQUIRED if --update is used.** Specifies the behavior for an update operation.
     - `append`: Deduplicate and write all unique records (old + new) to the files in the new collection folder.
@@ -138,9 +140,9 @@ python gws-log-collector.py --auth-method oauth --creds-path <oauth_credentials.
 - `--max-results` : Max results per API call (default: 1000)
 - `--threads` / `-t` : Number of parallel threads (default: 20)
 - `--write-batch-size` : Write log entries to disk every N records to reduce memory usage for large collections. Set to 0 to write only at the end (default: 100000)
-- `--no-progress` : Disable progress bars
-- `--quiet` / `-q` : Minimal output
-- `--verbose` / `-v` : Increase verbosity (can use multiple times)
+- `--no-progress` : Disable progress display (not recommended)
+- `--quiet` / `-q` : Minimal output (errors and final summary only)
+- `--verbose` / `-v` : Increase verbosity (can use multiple times: `-v`, `-vv`, `-vvv`)
 
 ### Examples
 
@@ -154,6 +156,11 @@ python gws-log-collector.py --auth-method service-account --creds-path creds.jso
 Specific applications:
 ```sh
 python gws-log-collector.py --auth-method service-account --creds-path creds.json --delegated-creds admin@yourdomain.com --gws-domain yourdomain.com --apps admin,login,drive,keep
+```
+
+Date range collection (from January 1st to January 31st, 2025):
+```sh
+python gws-log-collector.py --auth-method service-account --creds-path creds.json --delegated-creds admin@yourdomain.com --gws-domain yourdomain.com --from-date 2025-01-01 --to-date 2025-02-01
 ```
 
 Update collection (append mode):
@@ -178,6 +185,11 @@ Collect specific applications including Keep:
 python gws-log-collector.py --auth-method oauth --creds-path oauth_credentials.json --gws-domain yourdomain.com --apps admin,login,drive,keep
 ```
 
+Collect logs for the last week only:
+```sh
+python gws-log-collector.py --auth-method oauth --creds-path oauth_credentials.json --gws-domain yourdomain.com --from-date 2025-01-15 --to-date 2025-01-22
+```
+
 Update collection (diff mode):
 ```sh
 python gws-log-collector.py --auth-method oauth --creds-path oauth_credentials.json --gws-domain yourdomain.com --update path/to/collection_<old_timestamp>_initial_yourdomain.com --update-mode diff
@@ -187,6 +199,73 @@ Large collection with incremental writing and real-time progress display:
 ```sh
 python gws-log-collector.py --auth-method oauth --creds-path oauth_credentials.json --gws-domain yourdomain.com --write-batch-size 50000 --verbose
 ```
+
+## Verbose Mode Levels
+
+The script supports multiple verbosity levels for detailed debugging and monitoring:
+
+### **Default (no flags)**: Basic Progress
+- Shows application completion status
+- Progress updates for overall collection
+- Final execution summary
+
+### **`-v` (Level 1)**: Standard Verbose
+- All default output plus:
+- Authentication details and configuration
+- Collection start/completion messages
+- Stats file creation notifications
+
+### **`-vv` (Level 2)**: Detailed Verbose  
+- All Level 1 output plus:
+- Thread initialization and API session details
+- Date filtering information for each application
+- File operation details and record counts
+- Incremental writing progress for large collections
+
+### **`-vvv` (Level 3)**: Maximum Debug
+- All Level 2 output plus:
+- Page-by-page API fetch details
+- Configuration dump showing all parameters
+- Individual entry processing information
+- API retry attempts and timing details
+
+**Example with maximum verbosity:**
+```sh
+python gws-log-collector.py --auth-method oauth --creds-path oauth_credentials.json --gws-domain yourdomain.com -vvv
+```
+
+## Output Format
+
+The script provides structured, real-time output with ISO8601 UTC timestamps:
+
+### Console Output Format
+```
+[timestamp] | status       | application/progress       | details
+[2025-07-11T142051Z] | DONE         | access_transparency       | 0 activities
+[2025-07-11T142051Z] | DONE         | admin                     | 914 activities
+[2025-07-11T142056Z] | PROGRESS     | Overall Progress          | 19/23 apps done (83%) [Elapsed: 10.7s]
+[2025-07-11T142209Z] | DOWNLOADING  | token                     | 100000 activities
+[2025-07-11T142105Z] | ERROR        | ERROR                     | Application 'invalid_app' is not supported...
+```
+
+### Status Types
+- **DONE**: Application collection completed
+- **DOWNLOADING**: Intermediate progress during large collections  
+- **PROGRESS**: Overall collection progress updates
+- **ERROR**: Error messages with immediate display
+- **WARNING/INFO/DEBUG**: Additional messages based on verbosity level
+
+### CLI Output Audit Trail
+
+Every collection run generates a complete audit trail saved as `_stats_cli_output_<timestamp>_<collection_type>_<domain>.txt`:
+
+- **Complete Terminal Output**: Exact copy of everything displayed during execution
+- **Structured Formatting**: All messages follow the consistent `[timestamp] | level | context | message` format
+- **Execution Summary Included**: Full summary with timing, statistics, and file locations
+- **Compliance Ready**: Perfect for audit trails, debugging, and forensic documentation
+- **Timestamped**: Uses ISO8601 UTC timestamps for precise timing correlation
+
+The audit file contains everything you see on screen plus maintains perfect formatting for easy parsing and analysis.
 
 ## Supported Applications
 
@@ -201,6 +280,7 @@ The script automatically fetches the current list of supported applications from
 - `data_studio` - Data Studio activities
 - `drive` - Google Drive activities
 - `gcp` - Google Cloud Platform activities
+- `gemini_in_workspace_apps` - Gemini in Google Workspace activities
 - `gplus` - Google+ activities
 - `groups` - Google Groups activities
 - `groups_enterprise` - Google Groups Enterprise activities
@@ -218,15 +298,33 @@ The script automatically fetches the current list of supported applications from
 Use `--apps all` (default) to collect all available applications, or specify a comma-separated list.
 
 ## Output
-- Log files: One JSON file per application inside the collection folder (e.g., `collection_<timestamp>_<collection_type>_<gws_domain>/drive.json`).
-  - In `diff` update mode, these files only contain new records from the current run.
-  - In `append` update mode, these files contain all unique records (old + new).
-- Stats files: Stored in the parent directory of the collection folder.
-  - CSV: `_stats_<timestamp>_<collection_type>_<gws_domain>.csv`
-  - JSON: `_stats_<timestamp>_<collection_type>_<gws_domain>.json`
-  - Columns/keys in stats files:
-    - `application`, `file_path`, `record_count`, `updated_record_count`, `file_size`, `md5`, `sha1`, `collection_time`, `initial_collection_time`, `collection_type`, `original_update_path`
-- The `collection_type` in names and stats will indicate `initial`, `update-append`, or `update-diff`.
+
+### Collection Folder Structure
+Everything related to a collection is organized in a single folder:
+```
+collection_2025-08-13T201022Z_initial_alzetteinfosec.com/
+├── admin.json                                      # Application log files
+├── drive.json
+├── token.json
+├── ...
+├── _stats_2025-08-13T201022Z_initial_...csv        # Stats (CSV format)
+├── _stats_2025-08-13T201022Z_initial_...json       # Stats (JSON format)
+└── _stats_cli_output_2025-08-13T201022Z_...txt     # CLI output log
+```
+
+### File Details
+- **Log files**: One JSON file per application inside the collection folder
+  - In `diff` update mode, these files only contain new records from the current run
+  - In `append` update mode, these files contain all unique records (old + new)
+- **Stats files**: CSV and JSON files with collection metadata and file information
+  - Columns/keys: `application`, `file_path`, `record_count`, `updated_record_count`, `file_size`, `md5`, `sha1`, `collection_time`, `initial_collection_time`, `collection_type`, `original_update_path`
+  - Includes MD5 and SHA1 hashes for file integrity verification
+- **CLI Output file**: Complete audit trail of terminal output with structured formatting
+  - Exact copy of all console output with consistent timestamp formatting
+  - Includes execution summary, progress updates, and error messages
+  - Perfect for compliance documentation and debugging
+  - Uses ISO8601 UTC timestamps throughout
+- The `collection_type` in names and stats will indicate `initial`, `update-append`, or `update-diff`
 
 ## Requirements
 
@@ -242,7 +340,10 @@ Use `--apps all` (default) to collect all available applications, or specify a c
 - **Important**: Google API Client Library v2.35.0 or higher is required for Keep logs support.
 - OAuth authentication provides access to all log types, including Keep logs.
 - Service Account authentication now also supports Keep logs with the updated API version.
+- All output uses structured, consistent formatting with ISO8601 UTC timestamps for professional logging.
+- CLI audit trails provide complete execution records suitable for compliance and forensic analysis.
 - Stats files are sorted by application name for easy comparison.
+- Verbose mode provides granular control over output detail level for debugging and monitoring.
 - For more details, run:
   ```sh
   python gws-log-collector.py --help

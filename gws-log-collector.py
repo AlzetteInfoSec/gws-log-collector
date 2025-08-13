@@ -36,7 +36,7 @@ class Google(object):
     """
 
     # These applications will be collected by default
-    DEFAULT_APPLICATIONS = ['access_transparency', 'admin', 'calendar', 'chat', 'chrome', 'context_aware_access', 'data_studio', 'drive', 'gcp', 'gplus', 'groups', 'groups_enterprise', 'jamboard', 'keep', 'login', 'meet', 'mobile', 'rules', 'saml', 'token', 'user_accounts', 'vault']
+    DEFAULT_APPLICATIONS = ['access_transparency', 'admin', 'calendar', 'chat', 'chrome', 'context_aware_access', 'data_studio', 'drive', 'gcp', 'gemini_in_workspace_apps', 'gplus', 'groups', 'groups_enterprise', 'jamboard', 'keep', 'login', 'meet', 'mobile', 'rules', 'saml', 'token', 'user_accounts', 'vault']
     
     # API retry settings
     RETRY_MAX_ATTEMPTS = 5
@@ -54,7 +54,6 @@ class Google(object):
         self.max_results = kwargs.get('max_results', 1000)  # Default API page size
         self.num_threads = kwargs.get('num_threads', 20)    # Default 20 threads
         self.verbosity = kwargs.get('verbosity', 1)         # Default verbosity level
-        self.show_progress = kwargs.get('show_progress', True)  # Progress bar
         self.write_batch_size = kwargs.get('write_batch_size', 100000)  # Write to disk every N events
         self.gws_domain = kwargs['gws_domain']
         self.update_mode = kwargs.get('update_mode', None)
@@ -69,16 +68,24 @@ class Google(object):
         self.log_lock = threading.Lock()
         self.stats_lock = threading.Lock()
         
+        # Initialize CLI output logging early (needed for _queue_message calls)
+        self.cli_output_buffer = []  # Store all CLI output for later writing to file
+        
+        # Import any pre-initialization CLI output from global buffer
+        global _global_cli_buffer
+        if _global_cli_buffer:
+            self.cli_output_buffer.extend(_global_cli_buffer)
+        
         # Initialize credentials during startup (main thread)
         self._credentials = None
         if self.auth_method == 'oauth':
             if self.verbosity >= 1:
-                logging.info("Initializing OAuth authentication...")
+                self._queue_message("Initializing OAuth authentication...", 'info')
             # Set up OAuth credentials now in the main thread
             SCOPES = ['https://www.googleapis.com/auth/admin.reports.audit.readonly']
             self._credentials = self._get_oauth_credentials(SCOPES)
             if self.verbosity >= 1:
-                logging.info("OAuth authentication completed successfully")
+                self._queue_message("OAuth authentication completed successfully", 'info')
         
         # Collection type - used in folder and file names
         if self.update:
@@ -101,6 +108,7 @@ class Google(object):
         # Stats filename includes consistent timestamp, collection type, and gws_domain.
         self.stats_filename = f"_stats_{self.collection_timestamp}_{self.collection_type}_{self.gws_domain}.csv"
         self.stats_json_filename = f"_stats_{self.collection_timestamp}_{self.collection_type}_{self.gws_domain}.json"
+        self.cli_output_filename = f"_stats_cli_output_{self.collection_timestamp}_{self.collection_type}_{self.gws_domain}.txt"
         
         # Stats for CSV output
         self.file_stats_dict = {} # Using a dict, will be converted to list later
@@ -123,30 +131,29 @@ class Google(object):
         self._service_instance = None  # Class-level cache for same credentials
             
         if self.verbosity >= 2:
-            logging.info(f"Initialized with {self.num_threads} threads, verbosity level {self.verbosity}")
+            self._queue_message(f"Initialized with {self.num_threads} threads, verbosity level {self.verbosity}", 'info')
             
         # Start time measurement
         self.start_time = time.time()
         
         # Initialize display tracking
-        self._display_lines_count = 0
-        self._counts_display_lines = 0
         self._last_display_update = 0  # Initialize display throttling
+        self._previously_displayed_apps = set() # Track apps displayed in the last update
         
         # Initialize progress tracking for large collections
         self.app_activities = {}
         self.app_status = {}  # Track status: 'downloading', 'done'
         self.app_downloaded = {}  # Track downloaded counts for progress
-
+        
         # For update mode, load previous stats for initial_collection_time
         self.previous_initial_times = {}
         if self.update:
-            # Try to find the previous stats file in the original directory
-            # (assume parent of output_path is the original collection)
-            prev_dir = os.path.dirname(os.path.abspath(self.output_path.rstrip('/\\')))
+            # Try to find the previous stats file in the original directory being updated
+            # (not the parent of the new output_path)
+            prev_dir = os.path.dirname(os.path.abspath(self.original_update_path.rstrip('/\\')))
             prev_stats = None
             for fname in os.listdir(prev_dir):
-                if fname.startswith('stats_') and fname.endswith('.csv'):
+                if fname.startswith('_stats_') and fname.endswith('.csv'):
                     prev_stats = os.path.join(prev_dir, fname)
                     break
             if prev_stats and os.path.exists(prev_stats):
@@ -156,8 +163,52 @@ class Google(object):
                         for row in reader:
                             key = (row['application'], os.path.basename(row['file_path']))
                             self.previous_initial_times[key] = row.get('initial_collection_time', row.get('collection_time', self.collection_timestamp))
+                    if self.verbosity >= 2:
+                        self._queue_message(f"Loaded previous stats from {prev_stats}", 'info')
                 except Exception as e:
-                    logging.warning(f"Could not read previous stats file: {e}")
+                    self._queue_message(f"Could not read previous stats file: {e}", 'warning')
+            else:
+                if self.verbosity >= 2:
+                    self._queue_message(f"No previous stats file found in {prev_dir}", 'warning')
+
+    def _queue_message(self, message, level='info'):
+        """
+        Display messages immediately with proper timestamps during download and log to buffer.
+        Thread-safe with atomic print and buffer operations.
+        """
+        # Display immediately with ISO8601 UTC timestamp
+        timestamp = datetime.now(tz=tz.tzutc()).strftime('%Y-%m-%dT%H%M%SZ')
+        
+        output_line = None
+        if level == 'error':
+            output_line = f"[{timestamp}] | {'ERROR':<12} | {'ERROR':<25} | {message}"
+        elif level == 'warning':
+            output_line = f"[{timestamp}] | {'WARNING':<12} | {'WARNING':<25} | {message}"
+        elif level == 'info':
+            if self.verbosity >= 2:
+                output_line = f"[{timestamp}] | {'INFO':<12} | {'INFO':<25} | {message}"
+        elif level == 'debug':
+            if self.verbosity >= 3:
+                output_line = f"[{timestamp}] | {'DEBUG':<12} | {'DEBUG':<25} | {message}"
+        
+        # Thread-safe: atomic print and buffer operations
+        if output_line:
+            with self.log_lock:
+                print(output_line)
+                self.cli_output_buffer.append(output_line)
+
+    def _display_progress_update(self, app_name, count, status='DOWNLOADING'):
+        """
+        Display intermediate progress updates for apps that are downloading.
+        Thread-safe with atomic print and buffer operations.
+        """
+        timestamp = datetime.now(tz=tz.tzutc()).strftime('%Y-%m-%dT%H%M%SZ')
+        output_line = f"[{timestamp}] | {status:<12} | {app_name:<25} | {count} activities"
+        
+        # Thread-safe: atomic print and buffer operations
+        with self.log_lock:
+            print(output_line)
+            self.cli_output_buffer.append(output_line)
 
     @staticmethod
     def get_application_list():
@@ -170,7 +221,8 @@ class Google(object):
             r.raise_for_status()
             return r.json()['resources']['activities']['methods']['list']['parameters']['applicationName']['enum']
         except (requests.RequestException, KeyError, json.JSONDecodeError) as e:
-            logging.error(f"Error fetching application list: {e}")
+            # Use print for static method since we don't have access to structured_log
+            print(f"ERROR: Error fetching application list: {e}", file=sys.stderr)
             # Return default list as fallback
             return Google.DEFAULT_APPLICATIONS
 
@@ -217,7 +269,8 @@ class Google(object):
                     continue
                     
         except Exception as e:
-            logging.warning(f"Error reading date from log file {log_file_path}: {e}")
+            # Use print for static method since we don't have access to structured_log
+            print(f"WARNING: Error reading date from log file {log_file_path}: {e}", file=sys.stderr)
             
         return return_date
 
@@ -260,14 +313,12 @@ class Google(object):
             self._service_instance = service
             
             if self.verbosity >= 3:
-                with self.log_lock:
-                    logging.debug(f"Thread {threading.current_thread().name} created new API session using {self.auth_method}")
+                self._queue_message(f"Thread {threading.current_thread().name} created new API session using {self.auth_method}", 'debug')
                     
             return service
             
         except Exception as e:
-            with self.log_lock:
-                logging.error(f"Failed to create Google API session: {e}")
+            self._queue_message(f"Failed to create Google API session: {e}", 'error')
             raise
 
     def _get_oauth_credentials(self, scopes):
@@ -277,27 +328,23 @@ class Google(object):
         creds = None
         
         if self.verbosity >= 2:
-            with self.log_lock:
-                logging.debug(f"Looking for OAuth token at: {self.token_file}")
-                logging.debug(f"Token file exists: {os.path.exists(self.token_file)}")
+            self._queue_message(f"Looking for OAuth token at: {self.token_file}", 'debug')
+            self._queue_message(f"Token file exists: {os.path.exists(self.token_file)}", 'debug')
         
         # Check if we have a saved token (ALFA approach)
         if os.path.exists(self.token_file):
             try:
                 creds = Credentials.from_authorized_user_file(self.token_file)
                 if self.verbosity >= 2:
-                    with self.log_lock:
-                        logging.info(f"Loaded existing OAuth token from {self.token_file}")
+                    self._queue_message(f"Loaded existing OAuth token from {self.token_file}", 'info')
             except Exception as e:
                 # Check if it's the specific refresh_token missing error
                 if "missing fields refresh_token" in str(e):
                     if self.verbosity >= 1:
-                        with self.log_lock:
-                            logging.warning(f"Token missing refresh_token field. This is normal if you've previously authorized this app. Authentication will still work.")
+                        self._queue_message(f"Token missing refresh_token field. This is normal if you've previously authorized this app. Authentication will still work.", 'warning')
                 else:
                     if self.verbosity >= 1:
-                        with self.log_lock:
-                            logging.warning(f"Could not load existing token: {e}")
+                        self._queue_message(f"Could not load existing token: {e}", 'warning')
                 
                 # Try loading token manually like ALFA might
                 try:
@@ -313,12 +360,10 @@ class Google(object):
                         scopes=token_data.get('scopes')
                     )
                     if self.verbosity >= 2:
-                        with self.log_lock:
-                            logging.info(f"Manually loaded OAuth token from {self.token_file}")
+                        self._queue_message(f"Manually loaded OAuth token from {self.token_file}", 'info')
                 except Exception as e2:
                     if self.verbosity >= 1:
-                        with self.log_lock:
-                            logging.warning(f"Could not manually load token: {e2}")
+                        self._queue_message(f"Could not manually load token: {e2}", 'warning')
                     creds = None
                 
         # ALFA's approach: check validity and refresh if needed
@@ -342,15 +387,13 @@ class Google(object):
                 try:
                     creds.refresh(Request())
                     if self.verbosity >= 2:
-                        with self.log_lock:
-                            logging.info("Refreshed OAuth token")
+                        self._queue_message("Refreshed OAuth token", 'info')
                     # Save refreshed token
                     with open(self.token_file, 'w') as token:
                         token.write(creds.to_json())
                 except Exception as e:
                     if self.verbosity >= 1:
-                        with self.log_lock:
-                            logging.warning(f"Token refresh failed: {e}")
+                        self._queue_message(f"Token refresh failed: {e}", 'warning')
                     creds = None
             
             # If still no valid credentials, require re-init (don't auto-authenticate here)
@@ -401,8 +444,7 @@ class Google(object):
                 
                 # Log the retry at appropriate verbosity
                 if self.verbosity >= 2:
-                    with self.log_lock:
-                        logging.warning(f"API error ({status_code}), retry {retry_attempt}/{self.RETRY_MAX_ATTEMPTS}")
+                    self._queue_message(f"API error ({status_code}), retry {retry_attempt}/{self.RETRY_MAX_ATTEMPTS}", 'warning')
                 
                 # If we've exhausted all retries, break out
                 if retry_attempt >= self.RETRY_MAX_ATTEMPTS:
@@ -426,8 +468,7 @@ class Google(object):
                     self.stats['retries'] += 1
                 
                 if self.verbosity >= 2:
-                    with self.log_lock:
-                        logging.warning(f"Unexpected error: {e}, retry {retry_attempt}/{self.RETRY_MAX_ATTEMPTS}")
+                    self._queue_message(f"Unexpected error: {e}, retry {retry_attempt}/{self.RETRY_MAX_ATTEMPTS}", 'warning')
                 
                 if retry_attempt >= self.RETRY_MAX_ATTEMPTS:
                     break
@@ -441,6 +482,26 @@ class Google(object):
         # We've exhausted all retries and still failed
         with self.stats_lock:
             self.stats['errors'] += 1
+            
+        # Queue retry failure error for safe display by main thread
+        if last_exception:
+            error_str = str(last_exception)
+            if "does not match the pattern" in error_str and "applicationName" in error_str:
+                # Extract app name from error for cleaner message
+                if '"' in error_str:
+                    # Look for the value part: "applicationName" value "invalid_app_name"
+                    parts = error_str.split('"')
+                    if len(parts) >= 4:
+                        app_name = parts[3]  # The actual app name value
+                    else:
+                        app_name = parts[1]  # Fallback
+                    self._queue_message(f"Application '{app_name}' is not supported by Google Workspace API", 'error')
+                else:
+                    self._queue_message(f"Invalid application name specified", 'error')
+            else:
+                self._queue_message(f"API call failed after {self.RETRY_MAX_ATTEMPTS} retries: {last_exception}", 'error')
+        else:
+            self._queue_message(f"API call failed after {self.RETRY_MAX_ATTEMPTS} retries", 'error')
             
         # Re-raise the last exception
         if last_exception:
@@ -488,7 +549,7 @@ class Google(object):
                 'original_update_path': original_update_path
             }
         except Exception as e:
-            logging.error(f"Error calculating hash for {file_path}: {e}")
+            self._queue_message(f"Error calculating hash for {file_path}: {e}", 'error')
             return {
                 'application': app_name,
                 'file_path': file_path,
@@ -506,15 +567,11 @@ class Google(object):
     def _write_stats_csv(self):
         """
         Write stats_{timestamp}.csv file with information about each log file
-        Places the stats file in the parent directory of self.output_path.
+        Places the stats file in the collection directory.
         """
         try:
-            # Determine parent directory of the collection folder (self.output_path)
-            output_collection_parent_dir = os.path.dirname(os.path.abspath(self.output_path.rstrip('/\\')))
-            if not output_collection_parent_dir: # If output_path was a top-level dir name like "collection_foo"
-                output_collection_parent_dir = "." # Place in current working directory
-            
-            csv_path = os.path.join(output_collection_parent_dir, self.stats_filename)
+            # Place stats file directly in the collection directory
+            csv_path = os.path.join(self.output_path, self.stats_filename)
             
             with open(csv_path, 'w', newline='') as csvfile:
                 fieldnames = ['application', 'file_path', 'record_count', 'updated_record_count', 'file_size', 
@@ -524,21 +581,18 @@ class Google(object):
                 for stat in sorted(self.file_stats, key=lambda x: x['application']):
                     writer.writerow(stat)
             if self.verbosity >= 1:
-                logging.info(f"Wrote stats file to {csv_path}")
+                self._queue_message(f"Wrote stats file to {csv_path}", 'info')
         except Exception as e:
-            logging.error(f"Error writing stats CSV: {e}")
+            self._queue_message(f"Error writing stats CSV: {e}", 'error')
 
     def _write_stats_json(self):
         """
         Write _stats_{timestamp}.json file with information about each log file.
-        Places the stats file in the parent directory of self.output_path.
+        Places the stats file in the collection directory.
         """
         try:
-            output_collection_parent_dir = os.path.dirname(os.path.abspath(self.output_path.rstrip('/\\')))
-            if not output_collection_parent_dir:
-                output_collection_parent_dir = "."
-            
-            json_path = os.path.join(output_collection_parent_dir, self.stats_json_filename)
+            # Place stats file directly in the collection directory
+            json_path = os.path.join(self.output_path, self.stats_json_filename)
             
             # Ensure self.file_stats is sorted by application for consistent output
             sorted_stats = sorted(self.file_stats, key=lambda x: x.get('application', ''))
@@ -547,11 +601,30 @@ class Google(object):
                 json.dump(sorted_stats, jsonfile, indent=4)
             
             if self.verbosity >= 1:
-                logging.info(f"Wrote JSON stats file to {json_path}")
+                self._queue_message(f"Wrote JSON stats file to {json_path}", 'info')
         except Exception as e:
-            logging.error(f"Error writing JSON stats file: {e}")
+            self._queue_message(f"Error writing JSON stats file: {e}", 'error')
 
-    def get_logs(self, from_date=None):
+    def _write_cli_output(self):
+        """
+        Write CLI output to text file - exact copy of terminal output.
+        Places the CLI output file in the collection directory.
+        """
+        try:
+            # Place CLI output file directly in the collection directory
+            cli_output_path = os.path.join(self.output_path, self.cli_output_filename)
+            
+            with open(cli_output_path, 'w', encoding='utf-8') as cli_file:
+                # Write all captured CLI output exactly as it appeared on terminal
+                for line in self.cli_output_buffer:
+                    cli_file.write(line + '\n')
+            
+            # No need to display completion message here - it's handled in main script
+                
+        except Exception as e:
+            self._queue_message(f"Error writing CLI output file: {e}", 'error')
+
+    def get_logs(self, from_date=None, to_date=None):
         """ 
         Collect all logs from specified applications using thread pool
         """
@@ -586,9 +659,9 @@ class Google(object):
         
         # Log start of collection
         if self.verbosity >= 1:
-            logging.info(f"Starting log collection for {len(self.app_list)} applications using {self.num_threads} threads")
+            self._queue_message(f"Starting log collection for {len(self.app_list)} applications using {self.num_threads} threads", 'info')
             if self.update:
-                logging.info(f"Running in update mode (mode: {self.update_mode}) - behavior depends on mode.")
+                self._queue_message(f"Running in update mode (mode: {self.update_mode}) - behavior depends on mode.", 'info')
         
         # Prepare task queue with all applications
         tasks = []
@@ -604,23 +677,22 @@ class Google(object):
                 original_file = os.path.join(original_folder, f"{app}.json")
                 if not os.path.exists(original_file) or os.path.getsize(original_file) == 0:
                     if self.verbosity >= 2:
-                        with self.log_lock:
-                            logging.info(f"Skipping {app} (no original file or file is empty) in append mode.")
+                        self._queue_message(f"Skipping {app} (no original file or file is empty) in append mode", 'info')
                     skip_app = True
                     skipped_apps.add(app)
                     # For skipped apps, their entry in self.file_stats_dict remains the default one created above.
             
             if not skip_app:
                 if self.verbosity >= 2:
-                    with self.log_lock:
-                        logging.info(f"Checking most recent date for {app} (if applicable for update)...")
+                    self._queue_message(f"Checking most recent date for {app} (if applicable for update)...", 'info')
                 # For update modes, _check_recent_date on the *new* output_file (which would have been copied)
                 # or from_date if file is new or _check_recent_date fails.
                 app_from_date = self._check_recent_date(output_file) or from_date
                 if self.verbosity >= 2 and app_from_date:
-                    with self.log_lock:
-                        logging.info(f"Will only fetch {app} logs after {app_from_date}")
-                tasks.append((app, output_file, app_from_date))
+                    self._queue_message(f"Will only fetch {app} logs after {app_from_date}", 'info')
+                if self.verbosity >= 2 and to_date:
+                    self._queue_message(f"Will only fetch {app} logs before {to_date}", 'info')
+                tasks.append((app, output_file, app_from_date, to_date))
         
         # Initialize activity tracking for ALFA-style output
         self.app_activities = {app: 0 for app in self.app_list}
@@ -638,9 +710,8 @@ class Google(object):
         
         # Show initial ALFA-style output
         if self.verbosity >= 1:
-            print("Collecting logs...")
             # Reset display lines count for collection phase
-            self._display_lines_count = 0
+            self._last_display_update = 0
             self._display_activity_status()
         
         # Create a thread pool
@@ -651,12 +722,13 @@ class Google(object):
                     self._get_activity_logs,
                     app_task, # Renamed to avoid clash with loop var 'app'
                     output_file_task, # Renamed
-                    only_after_datetime_task # Renamed
-                ): (app_task, output_file_task) for app_task, output_file_task, only_after_datetime_task in tasks
+                    only_after_datetime_task, # Renamed
+                    only_before_datetime_task # New parameter
+                ): (app_task, output_file_task) for app_task, output_file_task, only_after_datetime_task, only_before_datetime_task in tasks
             }
             
             # Mark all submitted apps as in progress
-            for app_task, output_file_task, only_after_datetime_task in tasks:
+            for app_task, output_file_task, only_after_datetime_task, only_before_datetime_task in tasks:
                 self.apps_in_progress.add(app_task)
             
             # Update display to show in-progress status
@@ -681,7 +753,8 @@ class Google(object):
                             with open(output_file_processed, 'r') as f_recount:
                                 actual_record_count_in_file = sum(1 for line in f_recount if line.strip())
                     except Exception as e_recount:
-                        if self.verbosity >= 1: logging.warning(f"Could not recount lines for {output_file_processed}: {e_recount}")
+                        if self.verbosity >= 1: 
+                            self._queue_message(f"Could not recount lines for {output_file_processed}: {e_recount}", 'warning')
                         # Keep actual_record_count_in_file as 0 or last known good if partial read? For now, 0.
                     
                     with self.stats_lock:
@@ -697,11 +770,12 @@ class Google(object):
                     )
                     
                     if self.verbosity >= 2:
-                        with self.log_lock:
-                            logging.info(f"Completed {app_processed}: saved {newly_written_for_app} of {fetched_from_api_for_app} API entries. File has {actual_record_count_in_file} records.")
+                        self._queue_message(f"Completed {app_processed}: saved {newly_written_for_app} of {fetched_from_api_for_app} API entries. File has {actual_record_count_in_file} records.", 'info')
                             
                 except Exception as e_future:
-                    if self.verbosity >= 1: logging.error(f"Error processing {app_processed}: {e_future}")
+                    # Queue error for safe display
+                    if self.verbosity >= 1: 
+                        self._queue_message(f"Error processing {app_processed}: {e_future}", 'error')
                     with self.stats_lock:
                         self.stats['errors'] += 1
                         
@@ -719,7 +793,8 @@ class Google(object):
                     self.file_stats_dict[app_processed] = current_app_stats_dict_entry
                 else: 
                     # This case should ideally not be reached if pre-population covers all self.app_list
-                    if self.verbosity >= 0: logging.error(f"CRITICAL: App {app_processed} from future not found in pre-populated stats dictionary! Adding it now.")
+                    if self.verbosity >= 0: 
+                        self._queue_message(f"CRITICAL: App {app_processed} from future not found in pre-populated stats dictionary! Adding it now.", 'error')
                     self.file_stats_dict[app_processed] = current_app_stats_dict_entry # Add if somehow missing
                     
                 # Update progress tracking
@@ -727,11 +802,11 @@ class Google(object):
                 self.apps_done.add(app_processed)  # Add to completed
                 self.apps_completed += 1
                 
-                # Update progress display
+                # Update progress display (which will also process any queued messages)
                 if self.verbosity >= 1:
                     self._display_activity_status()
             
-        # Final display
+        # Final display and process any remaining queued messages
         if self.verbosity >= 1:
             self._display_activity_status(final=True)
         
@@ -744,14 +819,16 @@ class Google(object):
         # Write stats JSON file with timestamp (after all apps are ensured present and updated)
         self._write_stats_json() # _write_stats_json sorts by application before writing
         
+        # Note: CLI output file is written after execution summary in main script
+        
         # Calculate elapsed time
         elapsed = time.time() - operation_start
         
         # Final summary - always show this regardless of verbosity
-        logging.info(f"COMPLETED IN {elapsed:.2f}s: Saved {self.stats['total_saved']} of {self.stats['total_found']} records from API calls this run.")
+        self._queue_message(f"COMPLETED IN {elapsed:.2f}s: Saved {self.stats['total_saved']} of {self.stats['total_found']} records from API calls this run.", 'info')
         
         if self.verbosity >= 2:
-            logging.info(f"API Calls: {self.stats['api_calls']}, Retries: {self.stats['retries']}, Errors: {self.stats['errors']}")
+            self._queue_message(f"API Calls: {self.stats['api_calls']}, Retries: {self.stats['retries']}, Errors: {self.stats['errors']}", 'info')
         
         return self.stats
 
@@ -765,61 +842,58 @@ class Google(object):
         self._display_in_progress = True
         
         try:
-            # Move cursor up to overwrite previous output (except for first time)
-            if hasattr(self, '_display_lines_count') and self._display_lines_count > 0:
-                # Safety limit on cursor movement
-                lines_to_clear = min(self._display_lines_count, 50)  # Max 50 lines
-                for _ in range(lines_to_clear):
-                    print("\033[F\033[K", end="")  # Move up and clear line
-        
-            lines_printed = 0
-        
-            # Show applications in simplified tab-delimited format: downloaded activities - STATUS
-            for app in sorted(self.app_list):
+            # New approach: Print a simple, single line for each update to avoid overwriting.
+            
+            # Check for completed apps since last display update
+            newly_completed_apps = self.apps_done - self._previously_displayed_apps
+            
+            for app in sorted(list(newly_completed_apps)):
                 downloaded_count = self.app_downloaded.get(app, 0)
+                error_for_app = self.app_status.get(app) == 'error'
+                status = "DONE" if not error_for_app else "ERROR"
+                
+                # Use ISO8601 UTC format consistent with stats files
+                timestamp = datetime.now(tz=tz.tzutc()).strftime('%Y-%m-%dT%H%M%SZ')
+                output_line = f"[{timestamp}] | {status:<12} | {app:<25} | {downloaded_count} activities"
+                
+                # Thread-safe: atomic print and buffer operations
+                with self.log_lock:
+                    print(output_line)
+                    self.cli_output_buffer.append(output_line)
+                self._previously_displayed_apps.add(app)
+
+            # Show overall progress only when meaningful and avoid duplicates
+            show_progress = False
             
-                # Determine status indicator
-                if app in self.apps_done:
-                    status = "DONE"
-                elif app in self.apps_in_progress:
-                    status = "DOWNLOADING..."
-                elif hasattr(self, 'app_status') and self.app_status.get(app) == 'unsupported':
-                    status = "UNSUPPORTED"
-                else:
-                    status = ""
+            if final and self.apps_completed > 0:
+                # Show final progress only if we haven't just shown it
+                show_progress = (time.time() - self._last_display_update > 1)
+            elif not final and self.apps_completed > 0:
+                # Show periodic progress only if enough time has passed AND we have some progress
+                show_progress = (time.time() - self._last_display_update > 2)
             
-                # Show downloaded count only (no totals or percentages)
-                count_display = f"{downloaded_count}"
-                print(f"{app:>25}:\t{count_display:>10} activities - {status}")
-                lines_printed += 1
-        
-            # Show progress bar at the bottom (only if not final or if we want to show completion)
-            if self.apps_total > 0:
+            if show_progress and self.apps_total > 0:
                 progress_pct = (self.apps_completed / self.apps_total) * 100
                 elapsed = time.time() - self.start_time
-                rate = self.apps_completed / elapsed if elapsed > 0 else 0
-                remaining = (self.apps_total - self.apps_completed) / rate if rate > 0 and not final else 0
-            
-                progress_line = f"Overall Progress: {progress_pct:3.0f}% | {self.apps_completed}/{self.apps_total} [{elapsed:05.2f}<{remaining:05.2f}, {rate:5.2f}app/s]"
-                print(progress_line)
-                lines_printed += 1
-        
+                
+                error_count = self.stats['errors']
+                error_suffix = f" | {error_count} errors" if error_count > 0 else ""
+
+                # Use consistent timestamp format for progress lines too
+                timestamp = datetime.now(tz=tz.tzutc()).strftime('%Y-%m-%dT%H%M%SZ')
+                progress_line = f"[{timestamp}] | {'PROGRESS':<12} | {'Overall Progress':<25} | {self.apps_completed}/{self.apps_total} apps done ({progress_pct:.0f}%){error_suffix} [Elapsed: {elapsed:.1f}s]"
+                
+                # Thread-safe: atomic print and buffer operations
+                with self.log_lock:
+                    print(progress_line)
+                    self.cli_output_buffer.append(progress_line)
+                self._last_display_update = time.time()
+
             if final:
-                print()  # Add extra line at the end for spacing before summary
-                lines_printed += 1
-        
-            # Store the number of lines we printed for next time
-            self._display_lines_count = lines_printed
+                pass  # No extra spacing needed
             
         finally:
-            # Always reset the display flag
             self._display_in_progress = False
-
-    def _handle_unsupported_app_error(self, application_name, total_count=0):
-        """Handle unsupported application errors gracefully to prevent display corruption"""
-        if hasattr(self, 'app_status'):
-            self.app_status[application_name] = 'unsupported'
-        return total_count
 
     def _write_entries_to_file(self, entries, output_file, mode='a'):
         """Helper method to write entries to file with proper formatting"""
@@ -829,15 +903,13 @@ class Google(object):
                     f.write(entry.rstrip() + '\n')
             return True
         except Exception as e:
-            with self.log_lock:
-                logging.error(f"Error writing to {output_file}: {e}")
+            self._queue_message(f"Error writing to {output_file}: {e}", 'error')
             return False
 
-    def _get_activity_logs(self, application_name, output_file, only_after_datetime=None):
+    def _get_activity_logs(self, application_name, output_file, only_after_datetime=None, only_before_datetime=None):
         """ Collect activity logs from the specified application with pagination support and incremental writing """
         if self.verbosity >= 2:
-            with self.log_lock:
-                logging.info(f"Starting collection for {application_name}...")
+            self._queue_message(f"Starting collection for {application_name}...", 'info')
         
         # Initialize progress tracking (totals should already be set from upfront counting)
         if application_name not in self.app_downloaded:
@@ -869,14 +941,11 @@ class Google(object):
                             existing_lines.append(line)
                         except Exception as e:
                             if self.verbosity >= 3:
-                                with self.log_lock:
-                                    logging.warning(f"Error parsing existing entry for deduplication: {e}")
+                                self._queue_message(f"Error parsing existing entry for deduplication: {e}", 'warning')
                 if self.verbosity >= 2:
-                    with self.log_lock:
-                        logging.info(f"Loaded {len(existing_entries)} existing entries for deduplication in {application_name}")
+                    self._queue_message(f"Loaded {len(existing_entries)} existing entries for deduplication in {application_name}", 'info')
             except Exception as e:
-                with self.log_lock:
-                    logging.error(f"Error reading existing file for deduplication: {e}")
+                self._queue_message(f"Error reading existing file for deduplication: {e}", 'error')
                 existing_entries = set()
                 existing_lines = []
             new_entries = []
@@ -884,27 +953,45 @@ class Google(object):
                 while True:
                     page_count += 1
                     if self.verbosity >= 3:
-                        with self.log_lock:
-                            logging.debug(f"Fetching page {page_count} for {application_name}...")
+                        self._queue_message(f"Fetching page {page_count} for {application_name}...", 'debug')
                     try:
+                        # Build API call parameters
+                        api_params = {
+                            'userKey': 'all',
+                            'applicationName': application_name,
+                            'maxResults': self.max_results,
+                            'pageToken': page_token
+                        }
+                        
+                        # Add date filtering if we have a start date (for efficient updates)
+                        if only_after_datetime:
+                            # Convert to RFC3339 format for API
+                            start_time_str = only_after_datetime.isoformat()
+                            api_params['startTime'] = start_time_str
+                            if self.verbosity >= 2:
+                                self._queue_message(f"Using API date filter for {application_name}: startTime={start_time_str}", 'info')
+                        
+                        # Add end date filtering if we have an end date
+                        if only_before_datetime:
+                            # Convert to RFC3339 format for API
+                            end_time_str = only_before_datetime.isoformat()
+                            api_params['endTime'] = end_time_str
+                            if self.verbosity >= 2:
+                                self._queue_message(f"Using API date filter for {application_name}: endTime={end_time_str}", 'info')
+                        
                         results = self._api_call_with_retry(
                             service.activities().list,
-                            userKey='all',
-                            applicationName=application_name,
-                            maxResults=self.max_results,
-                            pageToken=page_token
+                            **api_params
                         )
                     except Exception as e:
                         error_str = str(e)
                         if "does not match the pattern" in error_str:
-                            with self.log_lock:
-                                if self.auth_method == 'service-account':
-                                    logging.warning(f"Application '{application_name}' not supported with Service Account authentication. Try --auth-method oauth for full access.")
-                                else:
-                                    logging.warning(f"Application '{application_name}' not supported by API (not available for this Google Workspace account/edition)")
+                            # Queue unsupported app error for safe display
+                            error_msg = f"Application '{application_name}' not supported by API or not available for this Google Workspace account/edition"
+                            self._queue_message(error_msg, 'error')
                         else:
-                            with self.log_lock:
-                                logging.error(f"Failed to fetch logs for {application_name}: {e}")
+                            # Queue API error for safe display
+                            self._queue_message(f"Failed to fetch logs for {application_name}: {e}", 'error')
                         with self.stats_lock:
                             self.stats['errors'] += 1
                         return 0, len(existing_entries)
@@ -914,33 +1001,35 @@ class Google(object):
                     
                     page_token = results.get('nextPageToken')
                     if self.verbosity >= 3:
-                        with self.log_lock:
-                            logging.debug(f"{application_name}: Page {page_count} has {page_activities} activities, next token: {page_token}")
+                        self._queue_message(f"{application_name}: Page {page_count} has {page_activities} activities, next token: {page_token}", 'debug')
                     if activities:
                         for entry in activities[::-1]:
-                            # Only new records after a certain date
-                            if only_after_datetime:
-                                try:
-                                    entry_datetime = dateparser.parse(entry['id']['time'])
-                                    if entry_datetime <= only_after_datetime:
-                                        continue
-                                except (KeyError, ValueError, TypeError) as e:
-                                    if self.verbosity >= 3:
-                                        with self.log_lock:
-                                            logging.warning(f"Invalid date in entry: {e}")
+                            # Only new records within the specified date range
+                            try:
+                                entry_datetime = dateparser.parse(entry['id']['time'])
+                                
+                                # Check if entry is after the start date
+                                if only_after_datetime and entry_datetime <= only_after_datetime:
                                     continue
+                                
+                                # Check if entry is before the end date
+                                if only_before_datetime and entry_datetime >= only_before_datetime:
+                                    continue
+                                    
+                            except (KeyError, ValueError, TypeError) as e:
+                                if self.verbosity >= 3:
+                                    self._queue_message(f"Invalid date in entry: {e}", 'warning')
+                                continue
                             try:
                                 entry_id_dict = entry.get('id', {})
                                 entry_id = f"{entry_id_dict.get('time', '')}-{entry_id_dict.get('uniqueQualifier', '')}"
                             except Exception as e:
                                 if self.verbosity >= 3:
-                                    with self.log_lock:
-                                        logging.warning(f"Error building entry_id: {e}")
+                                    self._queue_message(f"Error building entry_id: {e}", 'warning')
                                 continue
                             if entry_id in existing_entries:
                                 if self.verbosity >= 3:
-                                    with self.log_lock:
-                                        logging.debug(f"Skipping duplicate entry: {entry_id}")
+                                    self._queue_message(f"Skipping duplicate entry: {entry_id}", 'debug')
                                 continue
                             existing_entries.add(entry_id)
                             json_formatted_str = json.dumps(entry, separators=(',', ':'))
@@ -955,8 +1044,7 @@ class Google(object):
                         for line in new_entries:
                             f.write(line + '\n')
                     if self.verbosity >= 2:
-                        with self.log_lock:
-                            logging.info(f"Wrote {len(new_entries)} new entries to {output_file} (diff mode)")
+                        self._queue_message(f"Wrote {len(new_entries)} new entries to {output_file} (diff mode)", 'info')
                     total_lines = len(new_entries)
                 else:
                     # Default: append mode (write all unique entries)
@@ -968,8 +1056,7 @@ class Google(object):
                         for line in new_entries:
                             f.write(line + '\n')
                     if self.verbosity >= 2:
-                        with self.log_lock:
-                            logging.info(f"Wrote {len(new_entries)} new entries to {output_file} with deduplication. Total unique: {len(existing_lines) + len(new_entries)}")
+                        self._queue_message(f"Wrote {len(new_entries)} new entries to {output_file} with deduplication. Total unique: {len(existing_lines) + len(new_entries)}", 'info')
                     # After writing, recount the lines for record_count
                     try:
                         with open(output_file, 'r') as f:
@@ -977,11 +1064,16 @@ class Google(object):
                     except Exception:
                         total_lines = 0
             except Exception as e:
-                with self.log_lock:
-                    logging.error(f"Error processing file {output_file} for {application_name}: {e}")
+                # Queue error for safe display
+                self._queue_message(f"Error processing file {output_file} for {application_name}: {e}", 'error')
                 with self.stats_lock:
                     self.stats['errors'] += 1
                 total_lines = len(existing_entries) + len(new_entries)
+            
+            # Update progress tracking variables before returning (needed for correct display)
+            self.app_status[application_name] = 'done'
+            self.app_activities[application_name] = output_count  # New records found
+            self.app_downloaded[application_name] = output_count  # New records written
             
             # Return new records added, and total records in file
             return output_count, total_activities
@@ -993,27 +1085,45 @@ class Google(object):
                 while True:
                     page_count += 1
                     if self.verbosity >= 3:
-                        with self.log_lock:
-                            logging.debug(f"Fetching page {page_count} for {application_name}...")
+                        self._queue_message(f"Fetching page {page_count} for {application_name}...", 'debug')
                     try:
+                        # Build API call parameters
+                        api_params = {
+                            'userKey': 'all',
+                            'applicationName': application_name,
+                            'maxResults': self.max_results,
+                            'pageToken': page_token
+                        }
+                        
+                        # Add date filtering if we have a start date (for efficient updates)
+                        if only_after_datetime:
+                            # Convert to RFC3339 format for API
+                            start_time_str = only_after_datetime.isoformat()
+                            api_params['startTime'] = start_time_str
+                            if self.verbosity >= 2:
+                                self._queue_message(f"Using API date filter for {application_name}: startTime={start_time_str}", 'info')
+                        
+                        # Add end date filtering if we have an end date
+                        if only_before_datetime:
+                            # Convert to RFC3339 format for API
+                            end_time_str = only_before_datetime.isoformat()
+                            api_params['endTime'] = end_time_str
+                            if self.verbosity >= 2:
+                                self._queue_message(f"Using API date filter for {application_name}: endTime={end_time_str}", 'info')
+                        
                         results = self._api_call_with_retry(
                             service.activities().list,
-                            userKey='all',
-                            applicationName=application_name,
-                            maxResults=self.max_results,
-                            pageToken=page_token
+                            **api_params
                         )
                     except Exception as e:
                         error_str = str(e)
                         if "does not match the pattern" in error_str:
-                            with self.log_lock:
-                                if self.auth_method == 'service-account':
-                                    logging.warning(f"Application '{application_name}' not supported with Service Account authentication. Try --auth-method oauth for full access.")
-                                else:
-                                    logging.warning(f"Application '{application_name}' not supported by API (not available for this Google Workspace account/edition)")
+                            # Queue unsupported app error for safe display
+                            error_msg = f"Application '{application_name}' not supported by API or not available for this Google Workspace account/edition"
+                            self._queue_message(error_msg, 'error')
                         else:
-                            with self.log_lock:
-                                logging.error(f"Failed to fetch logs for {application_name}: {e}")
+                            # Queue API error for safe display
+                            self._queue_message(f"Failed to fetch logs for {application_name}: {e}", 'error')
                         with self.stats_lock:
                             self.stats['errors'] += 1
                         # Update status and return
@@ -1027,21 +1137,31 @@ class Google(object):
                     
                     page_token = results.get('nextPageToken')
                     if self.verbosity >= 3:
-                        with self.log_lock:
-                            logging.debug(f"{application_name}: Page {page_count} has {page_activities} activities, next token: {page_token}")
+                        self._queue_message(f"{application_name}: Page {page_count} has {page_activities} activities, next token: {page_token}", 'debug')
                             
                     if activities:
                         for entry in activities[::-1]:
-                            if only_after_datetime:
-                                try:
-                                    entry_datetime = dateparser.parse(entry['id']['time'])
-                                    if entry_datetime <= only_after_datetime:
-                                        continue
-                                except (KeyError, ValueError, TypeError) as e:
+                            # Local date filtering as safety net (API should handle most filtering)
+                            try:
+                                entry_datetime = dateparser.parse(entry['id']['time'])
+                                
+                                # Check if entry is after the start date
+                                if only_after_datetime and entry_datetime <= only_after_datetime:
+                                    # This should be rare with API filtering
                                     if self.verbosity >= 3:
-                                        with self.log_lock:
-                                            logging.warning(f"Invalid date in entry: {e}")
+                                        self._queue_message(f"Skipping old entry locally: {entry['id']['time']}", 'debug')
                                     continue
+                                
+                                # Check if entry is before the end date
+                                if only_before_datetime and entry_datetime >= only_before_datetime:
+                                    if self.verbosity >= 3:
+                                        self._queue_message(f"Skipping future entry locally: {entry['id']['time']}", 'debug')
+                                    continue
+                                    
+                            except (KeyError, ValueError, TypeError) as e:
+                                if self.verbosity >= 3:
+                                    self._queue_message(f"Invalid date in entry: {e}", 'warning')
+                                continue
                             json_formatted_str = json.dumps(entry, separators=(',', ':'))
                             output_count += 1
                             write_count += 1
@@ -1057,12 +1177,15 @@ class Google(object):
                                     write_mode = 'w' if output_count == len(written_entries) else 'a'
                                     if self._write_entries_to_file(written_entries, output_file, write_mode):
                                         if self.verbosity >= 2:
-                                            with self.log_lock:
-                                                logging.info(f"Incremental write: {len(written_entries)} records written to {application_name}")
+                                            self._queue_message(f"Incremental write: {len(written_entries)} records written to {application_name}", 'info')
                                         
                                         # Update progress tracking only when batch is written to disk
                                         self.app_downloaded[application_name] = output_count
                                         self.app_activities[application_name] = output_count
+                                        
+                                        # Show intermediate progress for downloading
+                                        if self.verbosity >= 1:
+                                            self._display_progress_update(application_name, output_count, 'DOWNLOADING')
                                         
                                         # Update display only when batch is written to disk
                                         if self.verbosity >= 1:
@@ -1087,6 +1210,10 @@ class Google(object):
                                     self.app_downloaded[application_name] = output_count
                                     self.app_activities[application_name] = output_count
                                     
+                                    # Show intermediate progress for downloading
+                                    if self.verbosity >= 1:
+                                        self._display_progress_update(application_name, output_count, 'DOWNLOADING')
+                                    
                                     if self.verbosity >= 1:
                                         current_time = time.time()
                                         # Only update display if enough time has passed (minimum 0.5 seconds between updates)
@@ -1098,8 +1225,8 @@ class Google(object):
                         break
                         
             except Exception as e:
-                with self.log_lock:
-                    logging.error(f"Error during collection for {application_name}: {e}")
+                # Queue error for safe display
+                self._queue_message(f"Error during collection for {application_name}: {e}", 'error')
                 with self.stats_lock:
                     self.stats['errors'] += 1
                     
@@ -1153,43 +1280,60 @@ class Google(object):
             seconds = total_execution_time % 60
             time_str = f"{hours} hours, {minutes} minutes, {seconds:.2f} seconds"
             
-        # Print summary
-        print("\n" + "="*80)
-        print(f"EXECUTION SUMMARY")
-        print("="*80)
-        print(f"Total execution time: {time_str}")
-        print(f"Google Workspace Domain: {self.gws_domain}")
-        print(f"Applications processed: {len(self.app_list)}")
-        print(f"Records found: {self.stats['total_found']}")
-        print(f"Records saved: {self.stats['total_saved']}")
-        print(f"Collection type: {self.collection_type.upper()}")
-        print(f"Collection folder: {os.path.abspath(self.output_path)}")
+        # Print summary and capture to CLI buffer
+        summary_lines = [
+            "",
+            "="*80,
+            "EXECUTION SUMMARY",
+            "="*80,
+            f"Total execution time: {time_str}",
+            f"Google Workspace Domain: {self.gws_domain}",
+            f"Applications processed: {len(self.app_list)}",
+            f"Records found: {self.stats['total_found']}",
+            f"Records saved: {self.stats['total_saved']}",
+            f"Collection type: {self.collection_type.upper()}",
+            f"Collection folder: {os.path.abspath(self.output_path)}"
+        ]
         
-        # Stats file information - path adjusted to parent directory
-        output_collection_parent_dir = os.path.dirname(os.path.abspath(self.output_path.rstrip('/\\')))
-        if not output_collection_parent_dir:
-            output_collection_parent_dir = "."
-        stats_csv_path = os.path.join(output_collection_parent_dir, self.stats_filename)
+        for line in summary_lines:
+            print(line)
+            # Add all lines to CLI buffer including empty lines for proper formatting
+            self.cli_output_buffer.append(line)
+        
+        # Stats file information - files are now in the collection directory
+        stats_csv_path = os.path.join(self.output_path, self.stats_filename)
+        stats_json_path = os.path.join(self.output_path, self.stats_json_filename)
+        cli_output_path = os.path.join(self.output_path, self.cli_output_filename)
+        
+        additional_lines = []
         
         if os.path.exists(stats_csv_path):
-            print(f"Stats file (CSV): {stats_csv_path}")
+            additional_lines.append(f"Stats file (CSV): {stats_csv_path}")
         
         # JSON Stats file information
-        stats_json_path = os.path.join(output_collection_parent_dir, self.stats_json_filename)
         if os.path.exists(stats_json_path):
-            print(f"Stats file (JSON): {stats_json_path}")
+            additional_lines.append(f"Stats file (JSON): {stats_json_path}")
+        
+        # CLI Output file information - always show path even if file doesn't exist yet
+        additional_lines.append(f"CLI Output file: {cli_output_path}")
             
         if self.stats['total_found'] > 0:
             # Calculate throughput
             records_per_second = self.stats['total_found'] / total_execution_time
-            print(f"Throughput: {records_per_second:.2f} records/second")
+            additional_lines.append(f"Throughput: {records_per_second:.2f} records/second")
             
         # Always show API statistics
-        print(f"API Calls Made: {self.stats['api_calls']}")
-        print(f"Retries: {self.stats['retries']}")
-        print(f"Errors: {self.stats['errors']}")
-            
-        print("="*80)
+        additional_lines.extend([
+            f"API Calls Made: {self.stats['api_calls']}",
+            f"Retries: {self.stats['retries']}",
+            f"Errors: {self.stats['errors']}",
+            "="*80
+        ])
+        
+        # Print and capture additional summary lines
+        for line in additional_lines:
+            print(line)
+            self.cli_output_buffer.append(line)
 
 
 def handle_oauth_init(args):
@@ -1289,6 +1433,20 @@ def handle_oauth_init(args):
         return False
 
 
+# Global CLI output buffer for pre-initialization logging
+_global_cli_buffer = []
+
+def structured_log(message, level='INFO'):
+    """
+    Create structured log output consistent with _queue_message format
+    """
+    timestamp = datetime.now(tz=tz.tzutc()).strftime('%Y-%m-%dT%H%M%SZ')
+    output_line = f"[{timestamp}] | {level:<12} | {level:<25} | {message}"
+    print(output_line)
+    
+    # Add to global CLI output buffer
+    _global_cli_buffer.append(output_line)
+
 if __name__ == '__main__':
 
     # Record start time
@@ -1321,6 +1479,9 @@ if __name__ == '__main__':
     parser.add_argument('--from-date', required=False, default=None,
                         type=lambda s: dateparser.parse(s).replace(tzinfo=tz.gettz('UTC')),
                         help="Only capture log entries from the specified date [yyyy-mm-dd format]. This flag is ignored if --update is set and existing files are already present.")
+    parser.add_argument('--to-date', required=False, default=None,
+                        type=lambda s: dateparser.parse(s).replace(tzinfo=tz.gettz('UTC')),
+                        help="Only capture log entries up to the specified date [yyyy-mm-dd format]. Can be combined with --from-date for date range filtering.")
     # Update behaviour
     parser.add_argument('--update', '-u', required=False, 
                         help="Update an existing collection folder with new logs. Specify the folder to update.")
@@ -1364,6 +1525,10 @@ if __name__ == '__main__':
     # If --update is used, --update-mode becomes mandatory.
     if args.update and not args.update_mode:
         parser.error("argument --update-mode is required when --update is used.")
+    
+    # Validate date range if both from-date and to-date are provided
+    if args.from_date and args.to_date and args.from_date >= args.to_date:
+        parser.error("--from-date must be earlier than --to-date")
 
     # Determine verbosity level
     if args.quiet:
@@ -1381,9 +1546,21 @@ if __name__ == '__main__':
         }
         log_level = log_levels.get(verbosity, logging.DEBUG)
 
-    # Setup logging
+    # Setup logging - explicitly use stderr to avoid interference with progress display
+    # Only show our application logs, suppress HTTP debug messages from libraries
     FORMAT = '%(asctime)s %(levelname)-8s %(message)s'
-    logging.basicConfig(format=FORMAT, level=log_level)
+    logging.basicConfig(format=FORMAT, level=log_level, stream=sys.stderr)
+    
+    # Suppress HTTP debug messages from underlying libraries for cleaner output
+    # Always suppress these for consistent formatting - we have our own structured logging
+    logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
+    logging.getLogger('httplib2').setLevel(logging.WARNING)
+    logging.getLogger('googleapiclient.discovery').setLevel(logging.WARNING)
+    logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.WARNING)
+    logging.getLogger('googleapiclient._auth').setLevel(logging.WARNING)
+    logging.getLogger('google.auth._default').setLevel(logging.WARNING)
+    logging.getLogger('google_auth_oauthlib.flow').setLevel(logging.WARNING)
+    logging.getLogger('googleapiclient.http').setLevel(logging.WARNING)  # This suppresses the URL debug messages
 
     # Determine collection type string for folder naming
     if args.update:
@@ -1397,7 +1574,7 @@ if __name__ == '__main__':
     # Handle --update option which now requires a target directory
     if args.update:
         if not os.path.isdir(args.update):
-            logging.error(f"Update target folder '{args.update}' does not exist or is not a directory.")
+            structured_log(f"Update target folder '{args.update}' does not exist or is not a directory.", 'ERROR')
             sys.exit(1)
         original_path = args.update # Keep for reference if needed
         
@@ -1406,7 +1583,7 @@ if __name__ == '__main__':
         new_path = f"collection_{consistent_timestamp_str}_{update_type_folder_str}_{args.gws_domain}"
 
         if verbosity >= 2:
-            logging.info(f"Updating from: {original_path}")
+            structured_log(f"Updating from: {original_path}", 'INFO')
         
         if not os.path.exists(new_path):
             os.makedirs(new_path)
@@ -1418,17 +1595,17 @@ if __name__ == '__main__':
                 try:
                     shutil.copy2(src_file, dst_file)
                     if verbosity >= 2:
-                        logging.info(f"Copied {filename} to new collection directory")
+                        structured_log(f"Copied {filename} to new collection directory", 'INFO')
                 except Exception as e:
-                    logging.error(f"Error copying {filename}: {e}")
+                    structured_log(f"Error copying {filename}: {e}", 'ERROR')
         args.output_path = new_path
-        logging.info(f"New collection directory: {new_path}")
+        structured_log(f"New collection directory: {new_path}", 'INFO')
         update_enabled = True
     else:
         update_enabled = False
         # Standardized output path for initial collection
         args.output_path = f"collection_{consistent_timestamp_str}_initial_{args.gws_domain}"
-        logging.info(f"No output path specified, using: {args.output_path}")
+        structured_log(f"No output path specified, using: {args.output_path}", 'INFO')
         if not os.path.exists(args.output_path):
             os.makedirs(args.output_path)
 
@@ -1440,41 +1617,40 @@ if __name__ == '__main__':
 
     # Validate max_results
     if args.max_results < 1 or args.max_results > 1000:
-        logging.warning("max-results must be between 1 and 1000, setting to 1000")
+        structured_log("max-results must be between 1 and 1000, setting to 1000", 'WARNING')
         args.max_results = 1000
         
     # Validate thread count
     if args.num_threads < 1:
-        logging.warning("threads must be at least 1, setting to 1")
+        structured_log("threads must be at least 1, setting to 1", 'WARNING')
         args.num_threads = 1
     elif args.num_threads > 50:
-        logging.warning("High thread count (>50) may cause API rate limiting or resource issues")
+        structured_log("High thread count (>50) may cause API rate limiting or resource issues", 'WARNING')
 
     # Validate write frequency
     if args.write_batch_size < 0:
-        logging.warning("write-batch-size must be 0 or positive, setting to 100000")
+        structured_log("write-batch-size must be 0 or positive, setting to 100000", 'WARNING')
         args.write_batch_size = 100000
 
     # Log authentication method
     if verbosity >= 1:
         if args.auth_method == 'oauth':
-            logging.info(f"Using OAuth authentication - supports all log types including Keep")
+            structured_log(f"Using OAuth authentication", 'INFO')
             if verbosity >= 2:
-                logging.info(f"OAuth port: {args.oauth_port}, token file: {args.token_file}")
+                structured_log(f"OAuth port: {args.oauth_port}, token file: {args.token_file}", 'INFO')
         else:
-            logging.info(f"Using Service Account authentication - automated access to all log types")
+            structured_log(f"Using Service Account authentication - automated access to all log types", 'INFO')
             if verbosity >= 2:
-                logging.info(f"Delegated credentials: {args.delegated_creds}")
+                structured_log(f"Delegated credentials: {args.delegated_creds}", 'INFO')
 
     # DEBUG: Show combined arguments to be used if verbose
     if verbosity >= 3:
-        logging.debug(f"Configuration: {vars(args)}")
+        structured_log(f"Configuration: {vars(args)}", 'DEBUG')
 
     try:
         # Pass in verbosity level to Google class
         google_args = vars(args).copy()
         google_args['verbosity'] = verbosity
-        google_args['show_progress'] = not args.no_progress
         google_args['update'] = update_enabled
         google_args['gws_domain'] = args.gws_domain
         google_args['update_mode'] = args.update_mode
@@ -1486,10 +1662,24 @@ if __name__ == '__main__':
         
         # Connect to Google API and get logs
         google = Google(**google_args)
-        stats = google.get_logs(args.from_date)
+        stats = google.get_logs(args.from_date, args.to_date)
         
-        # Print execution summary
+        # Add CLI output file message to buffer first
+        if verbosity >= 1:
+            cli_output_path = os.path.join(google.output_path, google.cli_output_filename)
+            completion_message = f"Wrote CLI output file to {cli_output_path}"
+            timestamp = datetime.now(tz=tz.tzutc()).strftime('%Y-%m-%dT%H%M%SZ')
+            output_line = f"[{timestamp}] | {'INFO':<12} | {'INFO':<25} | {completion_message}"
+            # Add to buffer so it's included in the CLI output file
+            google.cli_output_buffer.append(output_line)
+            # Show on terminal immediately
+            print(output_line)
+        
+        # Print execution summary to capture it in CLI buffer
         google.print_execution_summary()
+        
+        # Write CLI output file after execution summary is complete (now includes the CLI message)
+        google._write_cli_output()
         
         # Exit with appropriate code
         if stats['errors'] > 0:
@@ -1501,7 +1691,7 @@ if __name__ == '__main__':
         print("\nOperation cancelled by user")
         sys.exit(130)
     except Exception as e:
-        logging.error(f"Unhandled exception: {e}")
+        structured_log(f"Unhandled exception: {e}", 'ERROR')
         if verbosity >= 2:
             traceback.print_exc()
         sys.exit(1)

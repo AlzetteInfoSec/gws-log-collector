@@ -1,5 +1,5 @@
-google-api-python-client>=2.173.0  # Critical for Keep and Vault logs
-google-auth>=2.3.0
-google-auth-oauthlib>=0.4.6
-requests>=2.25.0
-python-dateutil>=2.8.0
+google-api-python-client>=2.179.0  # Admin SDK API for Google Workspace logs (latest version with reliability improvements)
+google-auth>=2.3.0                 # Google authentication library
+google-auth-oauthlib>=0.4.6        # OAuth flow for interactive authentication
+requests>=2.25.0                   # HTTP library for API discovery
+python-dateutil>=2.8.0             # Date parsing and timezone handling
