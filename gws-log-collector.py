@@ -1587,15 +1587,20 @@ if __name__ == '__main__':
         
         if not os.path.exists(new_path):
             os.makedirs(new_path)
-        # Copy logic remains the same, using new_path as destination
+        # Copy JSON log files and both CSV/JSON stats files from original collection
         for filename in os.listdir(original_path):
-            if filename.endswith('.json'):
+            # Copy JSON log files and both CSV and JSON stats files (but not CLI output files)
+            if (filename.endswith('.json') and not filename.startswith('_stats_cli_output_')) or (filename.startswith('_stats_') and filename.endswith('.csv')):
                 src_file = os.path.join(original_path, filename)
                 dst_file = os.path.join(new_path, filename)
                 try:
                     shutil.copy2(src_file, dst_file)
                     if verbosity >= 2:
-                        structured_log(f"Copied {filename} to new collection directory", 'INFO')
+                        if filename.startswith('_stats_'):
+                            file_type = "stats file"
+                        else:
+                            file_type = "log file"
+                        structured_log(f"Copied {file_type} {filename} to new collection directory", 'INFO')
                 except Exception as e:
                     structured_log(f"Error copying {filename}: {e}", 'ERROR')
         args.output_path = new_path
