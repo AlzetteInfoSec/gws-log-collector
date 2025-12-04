@@ -9,7 +9,7 @@ import time
 import sys
 import csv
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -36,7 +36,16 @@ class Google(object):
     """
 
     # These applications will be collected by default
-    DEFAULT_APPLICATIONS = ['access_transparency', 'admin', 'calendar', 'chat', 'chrome', 'context_aware_access', 'data_studio', 'drive', 'gcp', 'gemini_in_workspace_apps', 'gplus', 'groups', 'groups_enterprise', 'jamboard', 'keep', 'login', 'meet', 'mobile', 'rules', 'saml', 'token', 'user_accounts', 'vault']
+    # Note: 'gmail' requires both startTime and endTime parameters and max 30-day range
+    DEFAULT_APPLICATIONS = ['access_transparency', 'admin', 'calendar', 'chat', 'chrome', 'context_aware_access', 'classroom', 'data_studio', 'drive', 'gcp', 'gemini_in_workspace_apps', 'gmail', 'gplus', 'groups', 'groups_enterprise', 'jamboard', 'keep', 'login', 'meet', 'mobile', 'rules', 'saml', 'token', 'user_accounts', 'vault']
+    
+    # Applications that require both startTime and endTime (and max 30-day range)
+    APPS_REQUIRING_DATE_RANGE = ['gmail']
+    
+    # Note: We no longer pre-filter applications. The API discovery endpoint may list
+    # applications that aren't fully documented but may still work. We attempt to
+    # fetch logs for all applications returned by the discovery endpoint and let
+    # the API tell us which ones are actually supported/available for the account.
     
     # API retry settings
     RETRY_MAX_ATTEMPTS = 5
@@ -214,12 +223,19 @@ class Google(object):
     def get_application_list():
         """ 
         Returns a list of valid applicationName parameters for the activities.list() API method 
-        Note: this is the complete list of valid options, and some may not be valid on particular accounts.
+        from the API discovery endpoint.
+        
+        Note: This returns all applications listed by the API discovery endpoint, including
+        those that may not be fully documented. The script will attempt to fetch logs for all
+        of them, and the API will return appropriate errors for applications that aren't
+        supported or available for the specific Google Workspace account/edition.
         """
         try:
             r = requests.get('https://admin.googleapis.com/$discovery/rest?version=reports_v1', timeout=10)
             r.raise_for_status()
-            return r.json()['resources']['activities']['methods']['list']['parameters']['applicationName']['enum']
+            all_apps = r.json()['resources']['activities']['methods']['list']['parameters']['applicationName']['enum']
+            # Return all applications - let the API tell us which ones are actually supported
+            return all_apps
         except (requests.RequestException, KeyError, json.JSONDecodeError) as e:
             # Use print for static method since we don't have access to structured_log
             print(f"ERROR: Error fetching application list: {e}", file=sys.stderr)
@@ -685,14 +701,33 @@ class Google(object):
             if not skip_app:
                 if self.verbosity >= 2:
                     self._queue_message(f"Checking most recent date for {app} (if applicable for update)...", 'info')
-                # For update modes, _check_recent_date on the *new* output_file (which would have been copied)
-                # or from_date if file is new or _check_recent_date fails.
-                app_from_date = self._check_recent_date(output_file) or from_date
+                
+                # Special handling for apps requiring date ranges (like gmail)
+                # For these apps, if no explicit dates are provided, use maximum 30-day range from now
+                if app in self.APPS_REQUIRING_DATE_RANGE:
+                    if from_date is None and to_date is None:
+                        # Use maximum 30-day range from execution time
+                        now = datetime.now(tz=tz.tzutc())
+                        app_from_date = now - timedelta(days=30)
+                        app_to_date = now
+                        if self.verbosity >= 2:
+                            self._queue_message(f"{app} requires date range: using maximum 30-day range from now ({app_from_date} to {app_to_date})", 'info')
+                    else:
+                        # Use provided dates (will be validated/adjusted in _prepare_date_params_for_app)
+                        app_from_date = from_date
+                        app_to_date = to_date
+                else:
+                    # For other apps, use standard logic
+                    # For update modes, _check_recent_date on the *new* output_file (which would have been copied)
+                    # or from_date if file is new or _check_recent_date fails.
+                    app_from_date = self._check_recent_date(output_file) or from_date
+                    app_to_date = to_date
+                
                 if self.verbosity >= 2 and app_from_date:
                     self._queue_message(f"Will only fetch {app} logs after {app_from_date}", 'info')
-                if self.verbosity >= 2 and to_date:
-                    self._queue_message(f"Will only fetch {app} logs before {to_date}", 'info')
-                tasks.append((app, output_file, app_from_date, to_date))
+                if self.verbosity >= 2 and app_to_date:
+                    self._queue_message(f"Will only fetch {app} logs before {app_to_date}", 'info')
+                tasks.append((app, output_file, app_from_date, app_to_date))
         
         # Initialize activity tracking for ALFA-style output
         self.app_activities = {app: 0 for app in self.app_list}
@@ -905,6 +940,62 @@ class Google(object):
         except Exception as e:
             self._queue_message(f"Error writing to {output_file}: {e}", 'error')
             return False
+    
+    def _prepare_date_params_for_app(self, application_name, only_after_datetime, only_before_datetime):
+        """
+        Prepare startTime and endTime parameters for API calls.
+        Special handling for applications that require both dates (e.g., gmail).
+        Returns (start_time_str, end_time_str) tuple or (None, None) if not needed.
+        """
+        # Check if this application requires both startTime and endTime
+        requires_both = application_name in self.APPS_REQUIRING_DATE_RANGE
+        
+        if not requires_both:
+            # For other apps, use dates as provided
+            start_time_str = only_after_datetime.isoformat() if only_after_datetime else None
+            end_time_str = only_before_datetime.isoformat() if only_before_datetime else None
+            return (start_time_str, end_time_str)
+        
+        # For apps requiring both dates (like gmail)
+        now = datetime.now(tz=tz.tzutc())
+        
+        # If we have both dates, use them (but ensure range <= 30 days)
+        if only_after_datetime and only_before_datetime:
+            # Check if range exceeds 30 days
+            delta = only_before_datetime - only_after_datetime
+            if delta.days > 30:
+                # Adjust endTime to be 30 days after startTime
+                if self.verbosity >= 2:
+                    self._queue_message(f"Date range for {application_name} exceeds 30 days, adjusting endTime to 30 days after startTime", 'warning')
+                adjusted_end = only_after_datetime + timedelta(days=30)
+                # Don't exceed current time
+                if adjusted_end > now:
+                    adjusted_end = now
+                return (only_after_datetime.isoformat(), adjusted_end.isoformat())
+            return (only_after_datetime.isoformat(), only_before_datetime.isoformat())
+        
+        # If we only have startTime, set endTime to 30 days later (or now, whichever is earlier)
+        if only_after_datetime:
+            end_time = only_after_datetime + timedelta(days=30)
+            if end_time > now:
+                end_time = now
+            if self.verbosity >= 2:
+                self._queue_message(f"{application_name} requires both dates, setting endTime to 30 days after startTime (or now)", 'info')
+            return (only_after_datetime.isoformat(), end_time.isoformat())
+        
+        # If we only have endTime, set startTime to 30 days earlier
+        if only_before_datetime:
+            start_time = only_before_datetime - timedelta(days=30)
+            if self.verbosity >= 2:
+                self._queue_message(f"{application_name} requires both dates, setting startTime to 30 days before endTime", 'info')
+            return (start_time.isoformat(), only_before_datetime.isoformat())
+        
+        # If we have neither, use maximum 30-day range from current execution time
+        if self.verbosity >= 2:
+            self._queue_message(f"{application_name} requires both dates, using maximum 30-day range from execution time: {now - timedelta(days=30)} to {now}", 'info')
+        end_time = now
+        start_time = now - timedelta(days=30)
+        return (start_time.isoformat(), end_time.isoformat())
 
     def _get_activity_logs(self, application_name, output_file, only_after_datetime=None, only_before_datetime=None):
         """ Collect activity logs from the specified application with pagination support and incremental writing """
@@ -963,18 +1054,18 @@ class Google(object):
                             'pageToken': page_token
                         }
                         
-                        # Add date filtering if we have a start date (for efficient updates)
-                        if only_after_datetime:
-                            # Convert to RFC3339 format for API
-                            start_time_str = only_after_datetime.isoformat()
+                        # Prepare date parameters (with special handling for apps requiring both dates)
+                        start_time_str, end_time_str = self._prepare_date_params_for_app(
+                            application_name, only_after_datetime, only_before_datetime
+                        )
+                        
+                        # Add date filtering parameters
+                        if start_time_str:
                             api_params['startTime'] = start_time_str
                             if self.verbosity >= 2:
                                 self._queue_message(f"Using API date filter for {application_name}: startTime={start_time_str}", 'info')
                         
-                        # Add end date filtering if we have an end date
-                        if only_before_datetime:
-                            # Convert to RFC3339 format for API
-                            end_time_str = only_before_datetime.isoformat()
+                        if end_time_str:
                             api_params['endTime'] = end_time_str
                             if self.verbosity >= 2:
                                 self._queue_message(f"Using API date filter for {application_name}: endTime={end_time_str}", 'info')
@@ -1095,18 +1186,18 @@ class Google(object):
                             'pageToken': page_token
                         }
                         
-                        # Add date filtering if we have a start date (for efficient updates)
-                        if only_after_datetime:
-                            # Convert to RFC3339 format for API
-                            start_time_str = only_after_datetime.isoformat()
+                        # Prepare date parameters (with special handling for apps requiring both dates)
+                        start_time_str, end_time_str = self._prepare_date_params_for_app(
+                            application_name, only_after_datetime, only_before_datetime
+                        )
+                        
+                        # Add date filtering parameters
+                        if start_time_str:
                             api_params['startTime'] = start_time_str
                             if self.verbosity >= 2:
                                 self._queue_message(f"Using API date filter for {application_name}: startTime={start_time_str}", 'info')
                         
-                        # Add end date filtering if we have an end date
-                        if only_before_datetime:
-                            # Convert to RFC3339 format for API
-                            end_time_str = only_before_datetime.isoformat()
+                        if end_time_str:
                             api_params['endTime'] = end_time_str
                             if self.verbosity >= 2:
                                 self._queue_message(f"Using API date filter for {application_name}: endTime={end_time_str}", 'info')
