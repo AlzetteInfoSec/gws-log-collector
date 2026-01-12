@@ -6,7 +6,7 @@ This script fetches Google Workspace audit logs for one or more applications, su
 
 ## Features
 - **Dual Authentication Support**: Service Account (automated) and OAuth (interactive) authentication
-- **Complete Log Coverage**: Supports all 23+ Google Workspace applications including Keep, Vault, and Gemini logs
+- **Complete Log Coverage**: Supports all 38 Google Workspace applications including Gmail, Takeout, LDAP, and Gemini logs
 - **Structured Real-time Output**: Clean, timestamped progress display with ISO8601 UTC timestamps and consistent formatting
 - **Advanced Verbose Mode**: Multi-level verbosity with structured output (`-v`, `-vv`, `-vvv`) for detailed debugging
 - **Complete CLI Audit Trail**: Every terminal output saved to timestamped text file for compliance and debugging
@@ -269,31 +269,48 @@ The audit file contains everything you see on screen plus maintains perfect form
 
 ## Supported Applications
 
-The script automatically fetches the current list of supported applications from Google's API. Supported applications include:
+The script automatically fetches the current list of supported applications from Google's API discovery endpoint. As of January 2026, supported applications include:
 
+- `access_evaluation` - Access evaluation activities
 - `access_transparency` - Access Transparency activities
 - `admin` - Admin console activities
+- `admin_data_action` - Admin data action activities
+- `assignments` - Assignments activities
 - `calendar` - Google Calendar activities
 - `chat` - Google Chat activities
 - `chrome` - Chrome activities
+- `classroom` - Google Classroom activities
+- `cloud_search` - Cloud Search activities
+- `contacts` - Contacts activities
 - `context_aware_access` - Context-aware access activities
+- `data_migration` - Data migration activities
 - `data_studio` - Data Studio activities
+- `directory_sync` - Directory sync activities
 - `drive` - Google Drive activities
 - `gcp` - Google Cloud Platform activities
 - `gemini_in_workspace_apps` - Gemini in Google Workspace activities
+- `gmail` - Gmail activities (requires date range, max 30 days)
 - `gplus` - Google+ activities
+- `graduation` - Graduation activities
 - `groups` - Google Groups activities
 - `groups_enterprise` - Google Groups Enterprise activities
 - `jamboard` - Jamboard activities
 - `keep` - Google Keep activities
+- `ldap` - LDAP activities
 - `login` - User login activities
 - `meet` - Google Meet activities
+- `meet_hardware` - Meet hardware activities
 - `mobile` - Mobile device activities
+- `profile` - Profile activities
 - `rules` - Rules activities
 - `saml` - SAML activities
+- `takeout` - Google Takeout activities
+- `tasks` - Google Tasks activities
 - `token` - Token activities
 - `user_accounts` - User account activities
 - `vault` - Google Vault activities
+
+> **Note**: The application list is fetched dynamically from Google's API, so new log types will be automatically available as Google adds them.
 
 Use `--apps all` (default) to collect all available applications, or specify a comma-separated list.
 
@@ -329,7 +346,7 @@ collection_2025-08-13T201022Z_initial_alzetteinfosec.com/
 ## Requirements
 
 - Python 3.7+
-- Google API Client Library v2.35.0 or higher (for Keep logs support)
+- Google API Client Library v2.187.0 or higher (for all log types including Takeout, LDAP, Gmail)
 - Valid Google Workspace domain with admin access
 - Either:
   - Service account with domain-wide delegation, OR
@@ -337,9 +354,8 @@ collection_2025-08-13T201022Z_initial_alzetteinfosec.com/
 
 ## Notes
 - The script is multi-threaded and can be run repeatedly for incremental updates.
-- **Important**: Google API Client Library v2.35.0 or higher is required for Keep logs support.
-- OAuth authentication provides access to all log types, including Keep logs.
-- Service Account authentication now also supports Keep logs with the updated API version.
+- **Dynamic Discovery**: The script uses `static_discovery=False` to fetch the latest API schema from Google, ensuring new log types are automatically supported.
+- OAuth and Service Account authentication both provide access to all log types.
 - All output uses structured, consistent formatting with ISO8601 UTC timestamps for professional logging.
 - CLI audit trails provide complete execution records suitable for compliance and forensic analysis.
 - Stats files are sorted by application name for easy comparison.
@@ -351,11 +367,15 @@ collection_2025-08-13T201022Z_initial_alzetteinfosec.com/
 
 ## Troubleshooting
 
-### Keep Logs Not Available
-If you see "Application 'keep' not supported", ensure you have:
-1. Google API Client Library v2.35.0 or higher: `pip install google-api-python-client>=2.35.0`
-2. For Service Account: Proper domain-wide delegation configured
-3. For OAuth: Completed the one-time `--init` setup
+### Application Not Supported Errors
+If you see "Application 'X' not supported" errors:
+1. Ensure you have Google API Client Library v2.187.0 or higher: `pip install -r requirements.txt`
+2. The script uses dynamic discovery to fetch supported applications - check your network connection
+3. Some applications may return 0 records if there's no activity data (this is normal, not an error)
+4. For Service Account: Ensure domain-wide delegation is properly configured with scope `https://www.googleapis.com/auth/admin.reports.audit.readonly`
+
+### Gmail Logs
+Gmail logs require both start and end dates with a maximum 30-day range. When no dates are specified, the script automatically uses the last 30 days from execution time.
 
 ### OAuth Issues
 If OAuth initialization fails:

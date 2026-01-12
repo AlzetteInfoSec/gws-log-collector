@@ -35,17 +35,11 @@ class Google(object):
     Class for connecting to API and retrieving logs
     """
 
-    # These applications will be collected by default
-    # Note: 'gmail' requires both startTime and endTime parameters and max 30-day range
-    DEFAULT_APPLICATIONS = ['access_transparency', 'admin', 'calendar', 'chat', 'chrome', 'context_aware_access', 'classroom', 'data_studio', 'drive', 'gcp', 'gemini_in_workspace_apps', 'gmail', 'gplus', 'groups', 'groups_enterprise', 'jamboard', 'keep', 'login', 'meet', 'mobile', 'rules', 'saml', 'token', 'user_accounts', 'vault']
-    
     # Applications that require both startTime and endTime (and max 30-day range)
     APPS_REQUIRING_DATE_RANGE = ['gmail']
     
-    # Note: We no longer pre-filter applications. The API discovery endpoint may list
-    # applications that aren't fully documented but may still work. We attempt to
-    # fetch logs for all applications returned by the discovery endpoint and let
-    # the API tell us which ones are actually supported/available for the account.
+    # Discovery endpoint URL for fetching available applications dynamically
+    DISCOVERY_URL = 'https://admin.googleapis.com/$discovery/rest?version=reports_v1'
     
     # API retry settings
     RETRY_MAX_ATTEMPTS = 5
@@ -229,18 +223,27 @@ class Google(object):
         those that may not be fully documented. The script will attempt to fetch logs for all
         of them, and the API will return appropriate errors for applications that aren't
         supported or available for the specific Google Workspace account/edition.
+        
+        Raises:
+            RuntimeError: If the discovery endpoint cannot be reached or parsed.
         """
         try:
-            r = requests.get('https://admin.googleapis.com/$discovery/rest?version=reports_v1', timeout=10)
+            r = requests.get(Google.DISCOVERY_URL, timeout=10)
             r.raise_for_status()
             all_apps = r.json()['resources']['activities']['methods']['list']['parameters']['applicationName']['enum']
             # Return all applications - let the API tell us which ones are actually supported
             return all_apps
-        except (requests.RequestException, KeyError, json.JSONDecodeError) as e:
-            # Use print for static method since we don't have access to structured_log
-            print(f"ERROR: Error fetching application list: {e}", file=sys.stderr)
-            # Return default list as fallback
-            return Google.DEFAULT_APPLICATIONS
+        except requests.RequestException as e:
+            raise RuntimeError(
+                f"Failed to fetch application list from Google API discovery endpoint: {e}\n"
+                f"URL: {Google.DISCOVERY_URL}\n"
+                "Please check your network connection and try again."
+            ) from e
+        except (KeyError, json.JSONDecodeError) as e:
+            raise RuntimeError(
+                f"Failed to parse application list from Google API discovery endpoint: {e}\n"
+                "The discovery document structure may have changed. Please report this issue."
+            ) from e
 
     @staticmethod
     def _check_recent_date(log_file_path, sample_size=1000):
@@ -322,7 +325,10 @@ class Google(object):
                     self.creds_path, scopes=SCOPES)
                 credentials = creds.with_subject(self.delegated_creds)
 
-            service = build('admin', 'reports_v1', credentials=credentials)
+            # Use static_discovery=False to fetch live discovery document from Google
+            # This ensures new applicationName values (takeout, ldap, etc.) are accepted
+            # The Python client library's bundled static discovery doc may be outdated
+            service = build('admin', 'reports_v1', credentials=credentials, static_discovery=False)
             
             # Store in both thread-local and class-level cache
             self._service_cache.service = service

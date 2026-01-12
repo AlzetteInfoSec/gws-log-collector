@@ -1,5 +1,8 @@
-google-api-python-client>=2.179.0  # Admin SDK API for Google Workspace logs (latest version with reliability improvements)
-google-auth>=2.3.0                 # Google authentication library
-google-auth-oauthlib>=0.4.6        # OAuth flow for interactive authentication
-requests>=2.25.0                   # HTTP library for API discovery
-python-dateutil>=2.8.0             # Date parsing and timezone handling
+# Google Workspace Log Collector - Dependencies
+# Updated: 2026-01-11
+
+google-api-python-client>=2.187.0  # Admin SDK API for Google Workspace logs
+google-auth>=2.41.0                # Google authentication library
+google-auth-oauthlib>=1.2.3        # OAuth flow for interactive authentication
+requests>=2.32.5                   # HTTP library for API discovery
+python-dateutil>=2.9.0             # Date parsing and timezone handling
