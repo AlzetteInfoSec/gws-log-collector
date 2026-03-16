@@ -1,8 +1,9 @@
 # Google Workspace Log Collector - Dependencies
-# Updated: 2026-01-11
+# Updated: 2026-03-16
 
 google-api-python-client>=2.187.0  # Admin SDK API for Google Workspace logs
 google-auth>=2.41.0                # Google authentication library
 google-auth-oauthlib>=1.2.3        # OAuth flow for interactive authentication
+google-cloud-bigquery>=3.27.0      # BigQuery client for Workspace log & Drive inventory export
 requests>=2.32.5                   # HTTP library for API discovery
 python-dateutil>=2.9.0             # Date parsing and timezone handling

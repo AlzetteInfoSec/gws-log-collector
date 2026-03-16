@@ -21,6 +21,12 @@ from googleapiclient.errors import HttpError
 import shutil
 import traceback
 
+try:
+    from google.cloud import bigquery as bq_module
+    HAS_BIGQUERY = True
+except ImportError:
+    HAS_BIGQUERY = False
+
 # Google Workspace Log Collector
 #
 # Supports two authentication methods:
@@ -47,6 +53,8 @@ class Google(object):
     RETRY_BACKOFF_FACTOR = 2
     RETRY_MAX_DELAY = 60
 
+    BIGQUERY_SCOPE = 'https://www.googleapis.com/auth/bigquery'
+
     def __init__(self, **kwargs):
         self.creds_path = kwargs['creds_path']
         self.auth_method = kwargs.get('auth_method', 'service-account')
@@ -66,6 +74,13 @@ class Google(object):
         # OAuth specific settings
         self.oauth_port = kwargs.get('oauth_port', 8089)
         self.token_file = os.path.abspath(kwargs.get('token_file', 'token.json'))
+
+        # BigQuery mode settings
+        self.bigquery_mode = kwargs.get('bigquery_mode', False)
+        self.bq_project = kwargs.get('bq_project', None)
+        self.bq_dataset = kwargs.get('bq_dataset', None)
+        self.drive_inventory = kwargs.get('drive_inventory', False)
+        self._bq_client = None  # Cached BigQuery client
         
         # Initialize locks early (needed for OAuth logging)
         self.log_lock = threading.Lock()
@@ -84,12 +99,16 @@ class Google(object):
         if self.auth_method == 'oauth':
             if self.verbosity >= 1:
                 self._queue_message("Initializing OAuth authentication...", 'info')
-            # Set up OAuth credentials now in the main thread
             SCOPES = ['https://www.googleapis.com/auth/admin.reports.audit.readonly']
+            if self.bigquery_mode:
+                SCOPES.append(self.BIGQUERY_SCOPE)
             self._credentials = self._get_oauth_credentials(SCOPES)
             if self.verbosity >= 1:
                 self._queue_message("OAuth authentication completed successfully", 'info')
         
+        # Data source label - used in folder and file names
+        self.source_label = 'bigquery' if self.bigquery_mode else 'api'
+
         # Collection type - used in folder and file names
         if self.update:
             if self.update_mode == 'diff':
@@ -108,10 +127,10 @@ class Google(object):
         else:
             self.stats_original_update_path = self.output_path
         
-        # Stats filename includes consistent timestamp, collection type, and gws_domain.
-        self.stats_filename = f"_stats_{self.collection_timestamp}_{self.collection_type}_{self.gws_domain}.csv"
-        self.stats_json_filename = f"_stats_{self.collection_timestamp}_{self.collection_type}_{self.gws_domain}.json"
-        self.cli_output_filename = f"_stats_cli_output_{self.collection_timestamp}_{self.collection_type}_{self.gws_domain}.txt"
+        # Stats filename includes consistent timestamp, source, collection type, and gws_domain.
+        self.stats_filename = f"_stats_{self.collection_timestamp}_{self.source_label}_{self.collection_type}_{self.gws_domain}.csv"
+        self.stats_json_filename = f"_stats_{self.collection_timestamp}_{self.source_label}_{self.collection_type}_{self.gws_domain}.json"
+        self.cli_output_filename = f"_stats_cli_output_{self.collection_timestamp}_{self.source_label}_{self.collection_type}_{self.gws_domain}.txt"
         
         # Stats for CSV output
         self.file_stats_dict = {} # Using a dict, will be converted to list later
@@ -434,6 +453,455 @@ class Google(object):
                 raise ValueError(error_msg)
         
         return creds
+
+    # ------------------------------------------------------------------
+    # BigQuery session & helpers
+    # ------------------------------------------------------------------
+
+    def _bigquery_session(self):
+        """
+        Create or return a cached google.cloud.bigquery.Client.
+        Service-account: uses the key file directly with bigquery scope
+        (no domain delegation). OAuth: reuses the pre-initialized credentials.
+        """
+        if self._bq_client is not None:
+            return self._bq_client
+
+        if not HAS_BIGQUERY:
+            raise ImportError(
+                "google-cloud-bigquery is not installed. "
+                "Run: pip install google-cloud-bigquery"
+            )
+
+        if self.auth_method == 'oauth':
+            if not self._credentials:
+                raise ValueError("OAuth credentials not initialized")
+            self._bq_client = bq_module.Client(
+                project=self.bq_project, credentials=self._credentials
+            )
+        else:
+            creds = service_account.Credentials.from_service_account_file(
+                self.creds_path, scopes=[self.BIGQUERY_SCOPE]
+            )
+            self._bq_client = bq_module.Client(
+                project=self.bq_project, credentials=creds
+            )
+
+        if self.verbosity >= 2:
+            self._queue_message(
+                f"Created BigQuery client for project={self.bq_project}, dataset={self.bq_dataset}",
+                'info',
+            )
+        return self._bq_client
+
+    @staticmethod
+    def _bq_row_to_dict(row):
+        """Convert a BigQuery Row to a JSON-serializable dict, handling
+        special types (datetime, bytes, Repeated, etc.)."""
+        def _convert(value):
+            if value is None:
+                return None
+            if isinstance(value, (datetime,)):
+                return value.isoformat()
+            if isinstance(value, bytes):
+                import base64
+                return base64.b64encode(value).decode('ascii')
+            if isinstance(value, dict):
+                return {k: _convert(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_convert(v) for v in value]
+            return value
+
+        return {k: _convert(v) for k, v in row.items()}
+
+    @staticmethod
+    def _bq_row_dedup_key(row_dict):
+        """Return a hashable deduplication key for a BigQuery audit-log row."""
+        raw = json.dumps(row_dict, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _check_recent_date_bq(log_file_path, sample_size=1000):
+        """
+        Like _check_recent_date but looks for the ``time_usec`` field
+        (microseconds since epoch) that BigQuery audit rows use instead of
+        ``id.time``.  Returns a datetime or None.
+        """
+        return_date = None
+        if not os.path.exists(log_file_path):
+            return return_date
+        try:
+            file_size = os.path.getsize(log_file_path)
+            if file_size < 1024 * 1024:
+                with open(log_file_path, 'r') as f:
+                    lines = f.readlines()
+            else:
+                chunk_size = min(file_size, 1024 * 1024)
+                with open(log_file_path, 'r') as f:
+                    f.seek(max(0, file_size - chunk_size))
+                    if file_size > chunk_size:
+                        f.readline()
+                    lines = f.readlines()
+                lines = lines[-sample_size:] if len(lines) > sample_size else lines
+
+            for line in lines:
+                try:
+                    obj = json.loads(line)
+                    time_usec = obj.get('time_usec')
+                    if time_usec is not None:
+                        dt = datetime.fromtimestamp(int(time_usec) / 1_000_000, tz=tz.tzutc())
+                        if not return_date or return_date < dt:
+                            return_date = dt
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                    continue
+        except Exception as e:
+            print(f"WARNING: Error reading date from BQ log file {log_file_path}: {e}", file=sys.stderr)
+        return return_date
+
+    # ------------------------------------------------------------------
+    # BigQuery audit-log export
+    # ------------------------------------------------------------------
+
+    def _get_bigquery_app_logs(self, record_type, output_file, from_date=None, to_date=None):
+        """
+        Query BigQuery for a single record_type (app) and write rows as NDJSON.
+        Returns (new_records_written, total_rows_fetched).
+        Supports --update with deduplication (append) or diff semantics.
+        """
+        client = self._bigquery_session()
+        table_ref = f"`{self.bq_project}.{self.bq_dataset}.activity`"
+
+        where_clauses = ["record_type = @record_type"]
+        params = [bq_module.ScalarQueryParameter("record_type", "STRING", record_type)]
+
+        if from_date is not None:
+            where_clauses.append("_PARTITIONTIME >= @from_ts")
+            where_clauses.append("time_usec >= @from_usec")
+            params.append(bq_module.ScalarQueryParameter("from_ts", "TIMESTAMP", from_date))
+            params.append(bq_module.ScalarQueryParameter("from_usec", "INT64",
+                          int(from_date.timestamp() * 1_000_000)))
+        if to_date is not None:
+            where_clauses.append("_PARTITIONTIME < @to_ts")
+            where_clauses.append("time_usec < @to_usec")
+            params.append(bq_module.ScalarQueryParameter("to_ts", "TIMESTAMP", to_date))
+            params.append(bq_module.ScalarQueryParameter("to_usec", "INT64",
+                          int(to_date.timestamp() * 1_000_000)))
+
+        sql = f"SELECT * FROM {table_ref} WHERE {' AND '.join(where_clauses)}"
+        job_config = bq_module.QueryJobConfig(query_parameters=params)
+
+        if self.verbosity >= 2:
+            self._queue_message(f"BigQuery: querying {record_type} from {self.bq_dataset}", 'info')
+
+        existing_keys = set()
+        existing_lines = []
+        if self.update and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+            try:
+                with open(output_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            existing_keys.add(self._bq_row_dedup_key(obj))
+                            existing_lines.append(line)
+                        except Exception:
+                            continue
+                if self.verbosity >= 2:
+                    self._queue_message(
+                        f"Loaded {len(existing_keys)} existing entries for dedup ({record_type})", 'info'
+                    )
+            except Exception as e:
+                self._queue_message(f"Error reading existing BQ file for dedup: {e}", 'error')
+                existing_keys = set()
+                existing_lines = []
+
+        try:
+            query_job = client.query(sql, job_config=job_config)
+            rows_iter = query_job.result()
+        except Exception as e:
+            self._queue_message(f"BigQuery query failed for {record_type}: {e}", 'error')
+            with self.stats_lock:
+                self.stats['errors'] += 1
+            self.app_status[record_type] = 'error'
+            return 0, 0
+
+        new_lines = []
+        total_fetched = 0
+        for row in rows_iter:
+            total_fetched += 1
+            row_dict = self._bq_row_to_dict(row)
+            if self.update:
+                key = self._bq_row_dedup_key(row_dict)
+                if key in existing_keys:
+                    continue
+                existing_keys.add(key)
+            new_lines.append(json.dumps(row_dict, separators=(',', ':')))
+
+            if total_fetched % 10000 == 0 and self.verbosity >= 1:
+                self._display_progress_update(record_type, total_fetched, 'DOWNLOADING')
+                self.app_downloaded[record_type] = total_fetched
+
+        new_count = len(new_lines)
+
+        if self.update and self.update_mode == 'diff':
+            with open(output_file, 'w') as f:
+                for line in new_lines:
+                    f.write(line + '\n')
+        elif self.update and self.update_mode == 'append':
+            with open(output_file, 'w') as f:
+                for line in existing_lines:
+                    f.write(line.rstrip() + '\n')
+                for line in new_lines:
+                    f.write(line + '\n')
+        else:
+            with open(output_file, 'w') as f:
+                for line in new_lines:
+                    f.write(line + '\n')
+
+        self.app_status[record_type] = 'done'
+        self.app_activities[record_type] = new_count
+        self.app_downloaded[record_type] = total_fetched
+
+        if self.verbosity >= 2:
+            self._queue_message(
+                f"BigQuery {record_type}: fetched {total_fetched}, wrote {new_count} new rows", 'info'
+            )
+        return new_count, total_fetched
+
+    def _resolve_bq_record_types(self):
+        """Query the BigQuery activity table for distinct record_type values."""
+        client = self._bigquery_session()
+        table_ref = f"`{self.bq_project}.{self.bq_dataset}.activity`"
+        sql = f"SELECT DISTINCT record_type FROM {table_ref} ORDER BY record_type"
+        try:
+            rows = client.query(sql).result()
+            types = [row['record_type'] for row in rows if row['record_type']]
+            if self.verbosity >= 1:
+                self._queue_message(
+                    f"BigQuery: discovered {len(types)} record types: {', '.join(types)}",
+                    'info',
+                )
+            return types
+        except Exception as e:
+            self._queue_message(f"Failed to discover record types: {e}", 'error')
+            raise
+
+    def get_bigquery_logs(self, from_date=None, to_date=None):
+        """
+        Main entry point for BigQuery audit-log export.
+        Mirrors the structure of get_logs() for Admin SDK.
+        """
+        if self.app_list == 'all':
+            self.app_list = self._resolve_bq_record_types()
+
+        operation_start = time.time()
+
+        self.stats = {
+            'total_saved': 0,
+            'total_found': 0,
+            'api_calls': 0,
+            'retries': 0,
+            'errors': 0,
+        }
+
+        self.file_stats_dict = {}
+        for app_name in self.app_list:
+            output_file = os.path.join(self.output_path, f"{app_name}.json")
+            self.file_stats_dict[app_name] = self._calculate_file_stats(
+                app_name, output_file, 0, 0, self.stats_original_update_path
+            )
+
+        if self.verbosity >= 1:
+            self._queue_message(
+                f"Starting BigQuery log export for {len(self.app_list)} record types", 'info'
+            )
+            if self.update:
+                self._queue_message(
+                    f"Running in update mode (mode: {self.update_mode})", 'info'
+                )
+
+        tasks = []
+        skipped_apps = set()
+        for app in self.app_list:
+            output_file = os.path.join(self.output_path, f"{app}.json")
+            app_from = from_date
+            app_to = to_date
+
+            if self.update and self.update_mode == 'append':
+                orig = os.path.join(self.original_update_path or '', f"{app}.json")
+                if not os.path.exists(orig) or os.path.getsize(orig) == 0:
+                    if self.verbosity >= 2:
+                        self._queue_message(
+                            f"Skipping {app} (no original file) in append mode", 'info'
+                        )
+                    skipped_apps.add(app)
+                    continue
+
+            if self.update:
+                recent = self._check_recent_date_bq(output_file)
+                if recent:
+                    app_from = recent
+
+            tasks.append((app, output_file, app_from, app_to))
+
+        self.app_activities = {a: 0 for a in self.app_list}
+        self.app_downloaded = {a: 0 for a in self.app_list}
+        self.apps_completed = 0
+        self.apps_total = len(tasks)
+        self.apps_in_progress = set()
+        self.apps_done = set()
+
+        for s in skipped_apps:
+            self.apps_done.add(s)
+
+        if self.verbosity >= 1:
+            self._last_display_update = 0
+            self._display_activity_status()
+
+        with ThreadPoolExecutor(max_workers=self.num_threads) as executor:
+            futures = {
+                executor.submit(
+                    self._get_bigquery_app_logs, app_task, out_task, fd_task, td_task
+                ): (app_task, out_task)
+                for app_task, out_task, fd_task, td_task in tasks
+            }
+            for app_task, _, _, _ in tasks:
+                self.apps_in_progress.add(app_task)
+
+            if self.verbosity >= 1:
+                self._display_activity_status()
+
+            for future in as_completed(futures):
+                app_done, out_done = futures[future]
+                try:
+                    new_written, fetched = future.result()
+                    self.app_activities[app_done] = fetched
+
+                    actual_count = 0
+                    try:
+                        if os.path.exists(out_done):
+                            with open(out_done, 'r') as f:
+                                actual_count = sum(1 for l in f if l.strip())
+                    except Exception:
+                        pass
+
+                    with self.stats_lock:
+                        self.stats['total_saved'] += new_written
+                        self.stats['total_found'] += fetched
+
+                    entry = self._calculate_file_stats(
+                        app_done, out_done, actual_count, new_written,
+                        self.stats_original_update_path,
+                    )
+                except Exception as e:
+                    self._queue_message(f"Error processing {app_done}: {e}", 'error')
+                    with self.stats_lock:
+                        self.stats['errors'] += 1
+                    entry = self._calculate_file_stats(
+                        app_done, out_done, 0, 0, self.stats_original_update_path,
+                    )
+
+                self.file_stats_dict[app_done] = entry
+                self.apps_in_progress.discard(app_done)
+                self.apps_done.add(app_done)
+                self.apps_completed += 1
+                if self.verbosity >= 1:
+                    self._display_activity_status()
+
+        if self.verbosity >= 1:
+            self._display_activity_status(final=True)
+
+        self.file_stats = list(self.file_stats_dict.values())
+        self._write_stats_csv()
+        self._write_stats_json()
+
+        elapsed = time.time() - operation_start
+        self._queue_message(
+            f"COMPLETED IN {elapsed:.2f}s: Saved {self.stats['total_saved']} of "
+            f"{self.stats['total_found']} BigQuery rows this run.",
+            'info',
+        )
+        if self.verbosity >= 2:
+            self._queue_message(
+                f"Errors: {self.stats['errors']}", 'info'
+            )
+        return self.stats
+
+    # ------------------------------------------------------------------
+    # Drive inventory export
+    # ------------------------------------------------------------------
+
+    def get_drive_inventory(self):
+        """
+        Export the ``inventory`` and ``shared_drives`` tables from the
+        configured BigQuery dataset as NDJSON files.
+        Drive inventory is a point-in-time snapshot so date filtering and
+        deduplication are not applicable; the tables are always exported in
+        full, overwriting any previous inventory files.
+        """
+        if not hasattr(self, 'stats') or self.stats is None:
+            self.stats = {
+                'total_saved': 0, 'total_found': 0,
+                'api_calls': 0, 'retries': 0, 'errors': 0,
+            }
+        client = self._bigquery_session()
+        tables = {
+            'drive_inventory': 'inventory',
+            'drive_shared_drives': 'shared_drives',
+        }
+        inv_stats = []
+        for file_stem, bq_table in tables.items():
+            output_file = os.path.join(self.output_path, f"{file_stem}.json")
+            table_ref = f"`{self.bq_project}.{self.bq_dataset}.{bq_table}`"
+            sql = f"SELECT * FROM {table_ref}"
+
+            if self.verbosity >= 1:
+                self._queue_message(
+                    f"BigQuery: exporting {bq_table} → {file_stem}.json", 'info'
+                )
+
+            try:
+                rows = client.query(sql).result()
+                count = 0
+                with open(output_file, 'w') as f:
+                    for row in rows:
+                        f.write(json.dumps(self._bq_row_to_dict(row), separators=(',', ':')) + '\n')
+                        count += 1
+                        if count % 10000 == 0 and self.verbosity >= 1:
+                            self._display_progress_update(file_stem, count, 'DOWNLOADING')
+
+                if self.verbosity >= 1:
+                    self._display_progress_update(file_stem, count, 'DONE')
+
+                stat = self._calculate_file_stats(
+                    file_stem, output_file, count, count, self.stats_original_update_path
+                )
+                inv_stats.append(stat)
+
+                with self.stats_lock:
+                    self.stats['total_saved'] += count
+                    self.stats['total_found'] += count
+
+            except Exception as e:
+                self._queue_message(f"BigQuery query failed for {bq_table}: {e}", 'error')
+                with self.stats_lock:
+                    self.stats['errors'] += 1
+                stat = self._calculate_file_stats(
+                    file_stem, output_file, 0, 0, self.stats_original_update_path
+                )
+                inv_stats.append(stat)
+
+        if not hasattr(self, 'file_stats'):
+            self.file_stats = []
+        self.file_stats.extend(inv_stats)
+        for s in inv_stats:
+            self.file_stats_dict[s['application']] = s
+
+        self._write_stats_csv()
+        self._write_stats_json()
+        return inv_stats
 
     def _api_call_with_retry(self, service_method, **kwargs):
         """
@@ -1378,6 +1846,9 @@ class Google(object):
             time_str = f"{hours} hours, {minutes} minutes, {seconds:.2f} seconds"
             
         # Print summary and capture to CLI buffer
+        mode_label = "BigQuery" if self.bigquery_mode else "Admin SDK"
+        app_count = len(self.app_list) if isinstance(self.app_list, list) else '(dynamic)'
+
         summary_lines = [
             "",
             "="*80,
@@ -1385,7 +1856,8 @@ class Google(object):
             "="*80,
             f"Total execution time: {time_str}",
             f"Google Workspace Domain: {self.gws_domain}",
-            f"Applications processed: {len(self.app_list)}",
+            f"Data source: {mode_label}",
+            f"Applications processed: {app_count}",
             f"Records found: {self.stats['total_found']}",
             f"Records saved: {self.stats['total_saved']}",
             f"Collection type: {self.collection_type.upper()}",
@@ -1497,12 +1969,13 @@ def handle_oauth_init(args):
     print(f"\n[*] Starting OAuth flow...")
     
     try:
-        # Initialize OAuth flow
         SCOPES = ['https://www.googleapis.com/auth/admin.reports.audit.readonly']
+        if getattr(args, 'bigquery', False):
+            SCOPES.append(Google.BIGQUERY_SCOPE)
+            print(f"[+] Including BigQuery read-only scope for --bigquery mode")
         
         flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
         
-        # Use ALFA's approach - simple OAuth flow with access_type=offline to ensure refresh_token
         creds = flow.run_local_server(
             port=args.oauth_port,
             access_type='offline',
@@ -1569,7 +2042,7 @@ if __name__ == '__main__':
                         help="Path to store OAuth token file (default: token.json, only used with oauth method)")
     # Output path - now has default with timestamp
     parser.add_argument('--output-path', '-o', required=False, 
-                        help="Folder to save downloaded logs. Default is 'collection_<gws-domain>_<collection_type>_<collection_timestamp>'")
+                        help="Folder to save downloaded logs. Default is 'collection_<timestamp>_<source>_<collection_type>_<gws_domain>' where source is 'api' or 'bigquery'")
     parser.add_argument('--apps', '-a', required=False, default='all', 
                         help="Comma separated list of applications whose logs will be downloaded. "
                          "Or 'all' to attempt to download all available logs (default)")
@@ -1602,6 +2075,16 @@ if __name__ == '__main__':
     parser.add_argument('--verbose', '-v', required=False, action="count", default=0,
                         help="Increase verbosity level (can be used multiple times, e.g. -vv)")
 
+    # BigQuery mode arguments
+    parser.add_argument('--bigquery', required=False, action='store_true',
+                        help="Enable BigQuery mode: export logs from BigQuery instead of the Admin SDK Reports API")
+    parser.add_argument('--bq-project', required=False,
+                        help="BigQuery GCP project ID (required with --bigquery)")
+    parser.add_argument('--bq-dataset', required=False,
+                        help="BigQuery dataset name containing Workspace log export (required with --bigquery)")
+    parser.add_argument('--drive-inventory', required=False, action='store_true',
+                        help="Additionally export Drive inventory tables (inventory + shared_drives) from BigQuery. Requires --bigquery.")
+
     args = parser.parse_args()
 
     # Handle init command
@@ -1616,8 +2099,8 @@ if __name__ == '__main__':
         parser.error("argument --gws-domain is required")
     
     # Validation based on authentication method
-    if args.auth_method == 'service-account' and not args.delegated_creds:
-        parser.error("argument --delegated-creds is required when using service-account authentication")
+    if args.auth_method == 'service-account' and not args.delegated_creds and not args.bigquery:
+        parser.error("argument --delegated-creds is required when using service-account authentication (not required for --bigquery)")
 
     # If --update is used, --update-mode becomes mandatory.
     if args.update and not args.update_mode:
@@ -1626,6 +2109,21 @@ if __name__ == '__main__':
     # Validate date range if both from-date and to-date are provided
     if args.from_date and args.to_date and args.from_date >= args.to_date:
         parser.error("--from-date must be earlier than --to-date")
+
+    # BigQuery-specific validation
+    if args.bigquery:
+        if not HAS_BIGQUERY:
+            parser.error("--bigquery requires the google-cloud-bigquery package. Run: pip install google-cloud-bigquery")
+        if not args.bq_project:
+            parser.error("--bq-project is required when using --bigquery")
+        if not args.bq_dataset:
+            parser.error("--bq-dataset is required when using --bigquery")
+    if args.drive_inventory and not args.bigquery:
+        parser.error("--drive-inventory requires --bigquery")
+    if args.bq_project and not args.bigquery:
+        parser.error("--bq-project requires --bigquery")
+    if args.bq_dataset and not args.bigquery:
+        parser.error("--bq-dataset requires --bigquery")
 
     # Determine verbosity level
     if args.quiet:
@@ -1665,6 +2163,9 @@ if __name__ == '__main__':
     else:
         current_collection_type_str = 'initial'
 
+    # Data source label for folder naming
+    source_label = 'bigquery' if args.bigquery else 'api'
+
     # Current timestamp for naming (already renamed to consistent_timestamp_str by previous edit)
     consistent_timestamp_str = datetime.now(tz=tz.tzutc()).strftime('%Y-%m-%dT%H%M%SZ')
 
@@ -1677,7 +2178,7 @@ if __name__ == '__main__':
         
         # Standardized new path for update mode
         update_type_folder_str = 'update-diff' if args.update_mode == 'diff' else 'update-append'
-        new_path = f"collection_{consistent_timestamp_str}_{update_type_folder_str}_{args.gws_domain}"
+        new_path = f"collection_{consistent_timestamp_str}_{source_label}_{update_type_folder_str}_{args.gws_domain}"
 
         if verbosity >= 2:
             structured_log(f"Updating from: {original_path}", 'INFO')
@@ -1706,16 +2207,22 @@ if __name__ == '__main__':
     else:
         update_enabled = False
         # Standardized output path for initial collection
-        args.output_path = f"collection_{consistent_timestamp_str}_initial_{args.gws_domain}"
+        args.output_path = f"collection_{consistent_timestamp_str}_{source_label}_initial_{args.gws_domain}"
         structured_log(f"No output path specified, using: {args.output_path}", 'INFO')
         if not os.path.exists(args.output_path):
             os.makedirs(args.output_path)
 
     # Convert apps argument to list
-    if args.apps.strip().lower() == 'all':
-        args.apps = Google.get_application_list()
-    elif args.apps:
-        args.apps = [a.strip().lower() for a in args.apps.split(',')]
+    if args.bigquery:
+        if args.apps.strip().lower() == 'all':
+            args.apps = 'all'  # resolved dynamically at query time
+        else:
+            args.apps = [a.strip().lower() for a in args.apps.split(',')]
+    else:
+        if args.apps.strip().lower() == 'all':
+            args.apps = Google.get_application_list()
+        elif args.apps:
+            args.apps = [a.strip().lower() for a in args.apps.split(',')]
 
     # Validate max_results
     if args.max_results < 1 or args.max_results > 1000:
@@ -1734,15 +2241,19 @@ if __name__ == '__main__':
         structured_log("write-batch-size must be 0 or positive, setting to 100000", 'WARNING')
         args.write_batch_size = 100000
 
-    # Log authentication method
+    # Log authentication method and mode
     if verbosity >= 1:
+        if args.bigquery:
+            structured_log(f"BigQuery mode: project={args.bq_project}, dataset={args.bq_dataset}", 'INFO')
+            if args.drive_inventory:
+                structured_log("Drive inventory export enabled (additive)", 'INFO')
         if args.auth_method == 'oauth':
             structured_log(f"Using OAuth authentication", 'INFO')
             if verbosity >= 2:
                 structured_log(f"OAuth port: {args.oauth_port}, token file: {args.token_file}", 'INFO')
         else:
-            structured_log(f"Using Service Account authentication - automated access to all log types", 'INFO')
-            if verbosity >= 2:
+            structured_log(f"Using Service Account authentication", 'INFO')
+            if verbosity >= 2 and args.delegated_creds:
                 structured_log(f"Delegated credentials: {args.delegated_creds}", 'INFO')
 
     # DEBUG: Show combined arguments to be used if verbose
@@ -1757,14 +2268,23 @@ if __name__ == '__main__':
         google_args['gws_domain'] = args.gws_domain
         google_args['update_mode'] = args.update_mode
         google_args['original_update_path'] = args.update
-        google_args['consistent_timestamp'] = consistent_timestamp_str # Pass consistent timestamp
+        google_args['consistent_timestamp'] = consistent_timestamp_str
         google_args['auth_method'] = args.auth_method
         google_args['oauth_port'] = args.oauth_port
         google_args['token_file'] = args.token_file
+        google_args['bigquery_mode'] = args.bigquery
+        google_args['bq_project'] = getattr(args, 'bq_project', None)
+        google_args['bq_dataset'] = getattr(args, 'bq_dataset', None)
+        google_args['drive_inventory'] = getattr(args, 'drive_inventory', False)
         
-        # Connect to Google API and get logs
         google = Google(**google_args)
-        stats = google.get_logs(args.from_date, args.to_date)
+
+        if args.bigquery:
+            stats = google.get_bigquery_logs(args.from_date, args.to_date)
+            if args.drive_inventory:
+                google.get_drive_inventory()
+        else:
+            stats = google.get_logs(args.from_date, args.to_date)
         
         # Add CLI output file message to buffer first
         if verbosity >= 1:

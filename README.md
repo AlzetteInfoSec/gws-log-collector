@@ -4,8 +4,13 @@
 
 This script fetches Google Workspace audit logs for one or more applications, supporting both Service Account (automated) and OAuth (interactive) authentication methods. It supports initial and incremental (update) collections, deduplication, and produces stats files (CSV and JSON) for every run.
 
+In addition to the Admin SDK Reports API, the script can export richer audit logs and Drive inventory data directly from BigQuery using the `--bigquery` mode.
+
 ## Features
 - **Dual Authentication Support**: Service Account (automated) and OAuth (interactive) authentication
+- **Dual Data Source**: Admin SDK Reports API (default) or BigQuery export (`--bigquery`)
+- **BigQuery Audit Log Export**: Export full-fidelity Workspace audit logs from BigQuery, including fields not available in the Admin SDK (e.g. Gmail post-delivery interactions with link URLs)
+- **Drive Inventory Export**: Export Drive file metadata and shared drive information from BigQuery (`--drive-inventory`)
 - **Complete Log Coverage**: Supports all 38 Google Workspace applications including Gmail, Takeout, LDAP, and Gemini logs
 - **Structured Real-time Output**: Clean, timestamped progress display with ISO8601 UTC timestamps and consistent formatting
 - **Advanced Verbose Mode**: Multi-level verbosity with structured output (`-v`, `-vv`, `-vvv`) for detailed debugging
@@ -13,8 +18,8 @@ This script fetches Google Workspace audit logs for one or more applications, su
 - **Real-time Error Display**: Errors are shown immediately during collection with proper formatting
 - **Incremental Writing**: Configurable write frequency to reduce memory usage for large collections
 - **Multi-threaded Collection**: Parallel processing with detailed progress tracking for each application
-- **Update Collections**: Supports incremental updates with append or diff modes
-- **Deduplication**: Automatic deduplication using timestamp and uniqueQualifier
+- **Update Collections**: Supports incremental updates with append or diff modes (both Admin SDK and BigQuery)
+- **Deduplication**: Automatic deduplication using timestamp/uniqueQualifier (Admin SDK) or full-row hash (BigQuery)
 - **Comprehensive Stats**: Detailed CSV and JSON stats files for every collection with file integrity hashes
 - **Robust Error Handling**: Automatic retry logic with exponential backoff
 
@@ -41,6 +46,12 @@ Install dependencies (ideally in a virtual environment):
 
 ```sh
 pip install -r requirements.txt
+```
+
+For faster BigQuery reads, optionally install `pyarrow`:
+
+```sh
+pip install pyarrow
 ```
 
 ## Setup Options
@@ -97,6 +108,36 @@ pip install -r requirements.txt
 python gws-log-collector.py --init --creds-path oauth_credentials.json
 ```
 
+### Option C: BigQuery Export Setup (Additional)
+
+BigQuery mode uses the **same credentials** from Option A or B above, with additional GCP configuration.
+
+#### 1. Enable the BigQuery API
+- In your Google Cloud project, go to **APIs & Services > Library**
+- Search for **BigQuery API** and enable it
+- (Optional) Also enable **BigQuery Storage API** for faster reads if you installed `pyarrow`
+
+#### 2. Configure Workspace BigQuery Export
+- In the [Google Admin Console](https://admin.google.com/), go to **Reporting > Data integrations**
+- Set up **BigQuery export** — choose a GCP project and dataset name
+- (Optional) Enable **Drive inventory export** in the same section
+
+#### 3. Grant Access to the Service Account or OAuth User
+
+**For Service Account:**
+- In the [Google Cloud Console](https://console.cloud.google.com/), go to **IAM & Admin > IAM**
+- Grant your service account these roles on the BigQuery project:
+  - `BigQuery Data Viewer` (`roles/bigquery.dataViewer`)
+  - `BigQuery Job User` (`roles/bigquery.jobUser`)
+- Domain-wide delegation is **not** needed for BigQuery access
+
+**For OAuth:**
+- The authenticated user needs BigQuery access to the project/dataset
+- When running `--init` with `--bigquery`, the BigQuery scope is automatically included:
+  ```sh
+  python gws-log-collector.py --init --creds-path oauth_credentials.json --bigquery
+  ```
+
 ## Usage
 
 ### Service Account Authentication (Automated)
@@ -113,12 +154,29 @@ python gws-log-collector.py --init --creds-path <oauth_credentials.json>
 python gws-log-collector.py --auth-method oauth --creds-path <oauth_credentials.json> --gws-domain <yourdomain.com> [options]
 ```
 
+### BigQuery Mode — Service Account
+```sh
+python gws-log-collector.py --bigquery --bq-project <gcp-project-id> --bq-dataset <dataset> --creds-path <service-account.json> --gws-domain <yourdomain.com> [options]
+```
+
+### BigQuery Mode — OAuth
+```sh
+python gws-log-collector.py --bigquery --bq-project <gcp-project-id> --bq-dataset <dataset> --auth-method oauth --creds-path <oauth_credentials.json> --gws-domain <yourdomain.com> [options]
+```
+
 ### Required Arguments
 
-**For Service Account:**
+**For Service Account (Admin SDK):**
 - `--creds-path` : Path to the service account JSON file
 - `--delegated-creds` : Email of a super-admin user in your Google Workspace domain
 - `--gws-domain` : Your Google Workspace domain
+
+**For Service Account (BigQuery):**
+- `--creds-path` : Path to the service account JSON file
+- `--gws-domain` : Your Google Workspace domain
+- `--bq-project` : GCP project ID containing the BigQuery dataset
+- `--bq-dataset` : BigQuery dataset name (e.g. `gws_logs`)
+- `--delegated-creds` is **not** required for BigQuery mode
 
 **For OAuth:**
 - `--creds-path` : Path to the OAuth credentials JSON file (for --init and log collection)
@@ -129,20 +187,26 @@ python gws-log-collector.py --auth-method oauth --creds-path <oauth_credentials.
 - `--init` : Initialize OAuth credentials (required once before using OAuth)
 - `--oauth-port` : Port for OAuth callback server (default: 8089)
 - `--token-file` : Path to store OAuth token file (default: `token.json`)
-- `--output-path` / `-o` : Main output directory for collection subfolders (default: current directory). The script will create a subfolder like `collection_<timestamp>_<collection_type>_<gws_domain>` inside this path.
-- `--apps` / `-a` : Comma-separated list of applications or 'all' (default: 'all' - fetches from Google's discovery API)
+- `--output-path` / `-o` : Main output directory for collection subfolders (default: current directory). The script will create a subfolder like `collection_<timestamp>_<source>_<collection_type>_<gws_domain>` inside this path, where `<source>` is `api` or `bigquery`.
+- `--apps` / `-a` : Comma-separated list of applications or 'all' (default: 'all' - fetches from Google's discovery API, or from BigQuery `record_type` values in `--bigquery` mode)
 - `--from-date` : Only fetch logs after this date (ignored in update mode if files exist)
 - `--to-date` : Only fetch logs before this date (can be combined with --from-date for date range filtering)
 - `--update` / `-u` : Path to an existing collection folder to update with new logs (requires --update-mode).
 - `--update-mode` : **REQUIRED if --update is used.** Specifies the behavior for an update operation.
     - `append`: Deduplicate and write all unique records (old + new) to the files in the new collection folder.
     - `diff`: Only write new records found in this update to the files in the new collection folder (files will only contain new records from this run).
-- `--max-results` : Max results per API call (default: 1000)
+- `--max-results` : Max results per API call (default: 1000, Admin SDK only)
 - `--threads` / `-t` : Number of parallel threads (default: 20)
-- `--write-batch-size` : Write log entries to disk every N records to reduce memory usage for large collections. Set to 0 to write only at the end (default: 100000)
+- `--write-batch-size` : Write log entries to disk every N records to reduce memory usage for large collections. Set to 0 to write only at the end (default: 100000, Admin SDK only)
 - `--no-progress` : Disable progress display (not recommended)
 - `--quiet` / `-q` : Minimal output (errors and final summary only)
 - `--verbose` / `-v` : Increase verbosity (can use multiple times: `-v`, `-vv`, `-vvv`)
+
+### BigQuery Mode Options
+- `--bigquery` : Enable BigQuery mode — export logs from BigQuery instead of the Admin SDK Reports API
+- `--bq-project` : GCP project ID containing the BigQuery dataset (required with `--bigquery`)
+- `--bq-dataset` : BigQuery dataset name (required with `--bigquery`)
+- `--drive-inventory` : Additionally export Drive inventory tables (`inventory` and `shared_drives`) alongside audit logs. Requires `--bigquery`.
 
 ### Examples
 
@@ -198,6 +262,53 @@ python gws-log-collector.py --auth-method oauth --creds-path oauth_credentials.j
 Large collection with incremental writing and real-time progress display:
 ```sh
 python gws-log-collector.py --auth-method oauth --creds-path oauth_credentials.json --gws-domain yourdomain.com --write-batch-size 50000 --verbose
+```
+
+#### BigQuery Examples
+
+Export all audit logs from BigQuery (service account):
+```sh
+python gws-log-collector.py --bigquery --bq-project my-gcp-project --bq-dataset gws_logs --creds-path creds.json --gws-domain yourdomain.com
+```
+
+Export only Gmail and Drive logs from BigQuery:
+```sh
+python gws-log-collector.py --bigquery --bq-project my-gcp-project --bq-dataset gws_logs --creds-path creds.json --gws-domain yourdomain.com --apps gmail,drive
+```
+
+Export all audit logs from a specific date range:
+```sh
+python gws-log-collector.py --bigquery --bq-project my-gcp-project --bq-dataset gws_logs --creds-path creds.json --gws-domain yourdomain.com --from-date 2025-06-01 --to-date 2025-07-01
+```
+
+Export the entire BigQuery dataset (no date filter):
+```sh
+python gws-log-collector.py --bigquery --bq-project my-gcp-project --bq-dataset gws_logs --creds-path creds.json --gws-domain yourdomain.com
+```
+
+Export audit logs plus Drive inventory:
+```sh
+python gws-log-collector.py --bigquery --bq-project my-gcp-project --bq-dataset gws_logs --creds-path creds.json --gws-domain yourdomain.com --drive-inventory
+```
+
+Export only Drive inventory (specific apps not specified):
+```sh
+python gws-log-collector.py --bigquery --bq-project my-gcp-project --bq-dataset gws_logs --creds-path creds.json --gws-domain yourdomain.com --drive-inventory
+```
+
+BigQuery with OAuth:
+```sh
+python gws-log-collector.py --bigquery --bq-project my-gcp-project --bq-dataset gws_logs --auth-method oauth --creds-path oauth_credentials.json --gws-domain yourdomain.com
+```
+
+Update an existing BigQuery collection (append mode):
+```sh
+python gws-log-collector.py --bigquery --bq-project my-gcp-project --bq-dataset gws_logs --creds-path creds.json --gws-domain yourdomain.com --update path/to/collection_<old_timestamp>_initial_yourdomain.com --update-mode append
+```
+
+Update an existing BigQuery collection (diff mode — only new records):
+```sh
+python gws-log-collector.py --bigquery --bq-project my-gcp-project --bq-dataset gws_logs --creds-path creds.json --gws-domain yourdomain.com --update path/to/collection_<old_timestamp>_initial_yourdomain.com --update-mode diff
 ```
 
 ## Verbose Mode Levels
@@ -318,21 +429,43 @@ Use `--apps all` (default) to collect all available applications, or specify a c
 
 ### Collection Folder Structure
 Everything related to a collection is organized in a single folder:
+
+**Admin SDK mode:**
 ```
-collection_2025-08-13T201022Z_initial_alzetteinfosec.com/
-├── admin.json                                      # Application log files
+collection_2025-08-13T201022Z_api_initial_yourdomain.com/
+├── admin.json                                          # Application log files (NDJSON)
 ├── drive.json
 ├── token.json
 ├── ...
-├── _stats_2025-08-13T201022Z_initial_...csv        # Stats (CSV format)
-├── _stats_2025-08-13T201022Z_initial_...json       # Stats (JSON format)
-└── _stats_cli_output_2025-08-13T201022Z_...txt     # CLI output log
+├── _stats_..._api_initial_yourdomain.com.csv           # Stats (CSV format)
+├── _stats_..._api_initial_yourdomain.com.json          # Stats (JSON format)
+└── _stats_cli_output_..._api_initial_yourdomain.com.txt  # CLI output log
+```
+
+**BigQuery mode (with --drive-inventory):**
+```
+collection_2025-08-13T201022Z_bigquery_initial_yourdomain.com/
+├── admin.json                                          # Audit log files per record_type (NDJSON)
+├── drive.json
+├── gmail.json
+├── login.json
+├── ...
+├── drive_inventory.json                                # Drive inventory export (NDJSON)
+├── drive_shared_drives.json                            # Shared drives export (NDJSON)
+├── _stats_..._bigquery_initial_yourdomain.com.csv      # Stats (CSV format)
+├── _stats_..._bigquery_initial_yourdomain.com.json     # Stats (JSON format)
+└── _stats_cli_output_..._bigquery_initial_yourdomain.com.txt  # CLI output log
 ```
 
 ### File Details
-- **Log files**: One JSON file per application inside the collection folder
+- **Log files**: One NDJSON file per application/record_type inside the collection folder
   - In `diff` update mode, these files only contain new records from the current run
   - In `append` update mode, these files contain all unique records (old + new)
+  - In BigQuery mode, rows retain the full BigQuery schema (nested fields like `gmail.message_info.*`)
+- **Drive inventory files** (BigQuery mode with `--drive-inventory`):
+  - `drive_inventory.json` — one row per Drive item (file metadata, permissions, labels)
+  - `drive_shared_drives.json` — one row per shared drive (ID, name)
+  - These are always full snapshots (no date filtering or deduplication)
 - **Stats files**: CSV and JSON files with collection metadata and file information
   - Columns/keys: `application`, `file_path`, `record_count`, `updated_record_count`, `file_size`, `md5`, `sha1`, `collection_time`, `initial_collection_time`, `collection_type`, `original_update_path`
   - Includes MD5 and SHA1 hashes for file integrity verification
@@ -352,6 +485,13 @@ collection_2025-08-13T201022Z_initial_alzetteinfosec.com/
   - Service account with domain-wide delegation, OR
   - OAuth credentials for interactive authentication
 
+**Additional for BigQuery mode (`--bigquery`):**
+- `google-cloud-bigquery` v3.27.0 or higher (included in `requirements.txt`)
+- (Optional) `pyarrow` for faster BigQuery Storage API reads
+- BigQuery API enabled in your GCP project
+- Google Workspace BigQuery export configured in the Admin Console (Reporting > Data integrations)
+- Service account needs `BigQuery Data Viewer` + `BigQuery Job User` roles (no domain delegation needed), OR OAuth user needs BigQuery access
+
 ## Notes
 - The script is multi-threaded and can be run repeatedly for incremental updates.
 - **Dynamic Discovery**: The script uses `static_discovery=False` to fetch the latest API schema from Google, ensuring new log types are automatically supported.
@@ -360,6 +500,10 @@ collection_2025-08-13T201022Z_initial_alzetteinfosec.com/
 - CLI audit trails provide complete execution records suitable for compliance and forensic analysis.
 - Stats files are sorted by application name for easy comparison.
 - Verbose mode provides granular control over output detail level for debugging and monitoring.
+- **BigQuery mode** exports the full BigQuery row schema, which includes nested fields not available in the Admin SDK Reports API (e.g. `gmail.message_info.post_delivery_info.interaction.link_url` for link-click events).
+- **BigQuery date filtering** uses `_PARTITIONTIME` and `time_usec` for cost-efficient queries. When no date range is specified, the entire dataset is exported.
+- **Drive inventory** is always exported as a full snapshot regardless of `--from-date`/`--to-date` or `--update` mode.
+- **BigQuery deduplication** (for `--update --update-mode append`) uses a SHA-256 hash of the full serialized row, since BigQuery rows lack the `id.time` + `id.uniqueQualifier` structure of Admin SDK responses.
 - For more details, run:
   ```sh
   python gws-log-collector.py --help
@@ -382,3 +526,23 @@ If OAuth initialization fails:
 1. Ensure you've created "Desktop application" OAuth credentials
 2. Check that Admin SDK API is enabled in your Google Cloud project
 3. Try revoking previous authorizations at https://myaccount.google.com/permissions
+
+### BigQuery Mode Issues
+
+**"google-cloud-bigquery is not installed"**
+- Run `pip install google-cloud-bigquery` (or `pip install -r requirements.txt`)
+
+**Permission errors**
+- Service account needs `BigQuery Data Viewer` + `BigQuery Job User` on the GCP project
+- Domain-wide delegation is **not** needed for BigQuery — these are standard IAM roles
+- For OAuth: ensure your user has BigQuery access, and re-run `--init --bigquery` to include the BigQuery scope
+
+**Empty results or missing tables**
+- Verify the BigQuery export is configured in the Admin Console: **Reporting > Data integrations**
+- Check that the `--bq-project` and `--bq-dataset` match what is configured in the Admin Console
+- BigQuery export may take up to 24 hours to populate initial data after first enabling it
+- Use `--apps all` (default) to discover which `record_type` values exist in your dataset
+
+**Drive inventory tables not found**
+- Drive inventory export must be separately enabled in the Admin Console under **Reporting > Data integrations**
+- The `inventory` and `shared_drives` tables are created in the dataset you configured
