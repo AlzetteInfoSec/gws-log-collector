@@ -670,23 +670,37 @@ class Google(object):
             )
         return new_count, total_fetched
 
+    KNOWN_BQ_RECORD_TYPES = sorted([
+        'access_transparency', 'admin', 'calendar', 'chat', 'chrome',
+        'classroom', 'data_studio', 'drive', 'gcp', 'gmail', 'groups',
+        'groups_enterprise', 'jamboard', 'keep', 'login', 'meet', 'mobile',
+        'rules', 'saml', 'token', 'user_accounts', 'vault',
+    ])
+
     def _resolve_bq_record_types(self):
-        """Query the BigQuery activity table for distinct record_type values."""
+        """Discover record_type values from the BigQuery activity table,
+        merged with the known set so that every supported type gets a file
+        even when it has zero rows in the current dataset/date range."""
         client = self._bigquery_session()
         table_ref = f"`{self.bq_project}.{self.bq_dataset}.activity`"
         sql = f"SELECT DISTINCT record_type FROM {table_ref} ORDER BY record_type"
         try:
             rows = client.query(sql).result()
-            types = [row['record_type'] for row in rows if row['record_type']]
-            if self.verbosity >= 1:
-                self._queue_message(
-                    f"BigQuery: discovered {len(types)} record types: {', '.join(types)}",
-                    'info',
-                )
-            return types
+            discovered = {row['record_type'] for row in rows if row['record_type']}
         except Exception as e:
             self._queue_message(f"Failed to discover record types: {e}", 'error')
             raise
+
+        all_types = sorted(discovered | set(self.KNOWN_BQ_RECORD_TYPES))
+        if self.verbosity >= 1:
+            extra = discovered - set(self.KNOWN_BQ_RECORD_TYPES)
+            self._queue_message(
+                f"BigQuery: {len(all_types)} record types ({len(discovered)} with data"
+                + (f", {len(extra)} previously unknown: {', '.join(sorted(extra))}" if extra else "")
+                + ")",
+                'info',
+            )
+        return all_types
 
     def get_bigquery_logs(self, from_date=None, to_date=None):
         """
